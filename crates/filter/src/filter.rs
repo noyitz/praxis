@@ -11,7 +11,7 @@ use praxis_core::config::InsecureOptions;
 
 pub(crate) use crate::context::HttpFilterContext;
 use crate::{
-    actions::FilterAction,
+    actions::{FilterAction, SelectedUpstreamBodyOutcome},
     body::{BodyAccess, BodyMode},
     builtins::http::payload_processing::compression_config::CompressionConfig,
     pipeline::FilterPipeline,
@@ -145,8 +145,6 @@ pub trait HttpFilter: Send + Sync {
     fn visit_nested_pipelines(&mut self, _visitor: &mut dyn FnMut(&mut FilterPipeline)) {}
 
     /// Called for each response, in reverse pipeline order.
-    ///
-    /// Default: [`FilterAction::Continue`]
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         let _ = ctx;
         Ok(FilterAction::Continue)
@@ -179,6 +177,32 @@ pub trait HttpFilter: Send + Sync {
     ///
     /// [`on_response_body`]: HttpFilter::on_response_body
     fn response_body_access(&self) -> BodyAccess {
+        BodyAccess::None
+    }
+
+    /// Declares what access this filter needs to the request body during
+    /// the selected-upstream phase.
+    ///
+    /// The selected-upstream request-body phase runs after the request
+    /// phase has chosen an upstream cluster, giving a filter a final
+    /// opportunity to inspect or rewrite the request body for the
+    /// specific upstream it is about to be forwarded to. Return
+    /// [`BodyAccess::None`] (the default) to opt out,
+    /// [`BodyAccess::ReadOnly`] to observe the body in
+    /// [`on_selected_upstream_request_body`], or
+    /// [`BodyAccess::ReadWrite`] to mutate it.
+    ///
+    /// A participating filter must declare a bounded
+    /// [`BodyMode::StreamBuffer`] via [`request_body_mode`] so the
+    /// complete body is buffered before this phase runs; the phase reuses
+    /// the same request-body delivery mode rather than defining its own.
+    /// Pipeline validation rejects a participant whose
+    /// [`request_body_mode`] is not a bounded `StreamBuffer`.
+    ///
+    /// [`on_selected_upstream_request_body`]: HttpFilter::on_selected_upstream_request_body
+    /// [`request_body_mode`]: HttpFilter::request_body_mode
+    /// [`BodyMode::StreamBuffer`]: crate::BodyMode::StreamBuffer
+    fn selected_upstream_request_body_access(&self) -> BodyAccess {
         BodyAccess::None
     }
 
@@ -229,8 +253,7 @@ pub trait HttpFilter: Send + Sync {
     ///
     /// The config watcher uses this to decide which files should trigger a
     /// reload. A filter whose configuration lives entirely inside the Praxis
-    /// config has nothing to declare, which is why the default is empty and why
-    /// adding this is additive for every existing filter.
+    /// config has nothing to declare.
     ///
     /// Paths are returned as configured, not canonicalized: the watcher does its
     /// own resolution because it has to handle symlinks and relative paths
@@ -242,7 +265,7 @@ pub trait HttpFilter: Send + Sync {
     /// Apply global [`InsecureOptions`] to this filter.
     ///
     /// Filters that support insecure overrides (e.g. CSRF
-    /// log-only mode) override this. Default: no-op.
+    /// log-only mode) override this.
     ///
     /// [`InsecureOptions`]: praxis_core::config::InsecureOptions
     fn apply_insecure_options(&self, _options: &InsecureOptions) {}
@@ -314,6 +337,39 @@ pub trait HttpFilter: Send + Sync {
         let _ = (ctx, body, end_of_stream);
         Ok(FilterAction::Continue)
     }
+
+    /// Called once with the fully buffered request body after the request
+    /// phase has selected an upstream cluster.
+    ///
+    /// Runs only for filters that declare
+    /// [`selected_upstream_request_body_access`] other than
+    /// [`BodyAccess::None`], in pipeline order, and only if the filter
+    /// executed during the request phase. `body` holds the complete
+    /// request body (`None` when the request had no body). Filters that
+    /// declared [`BodyAccess::ReadWrite`] may mutate `body` in place;
+    /// this is a working value distinct from any canonical body the
+    /// pipeline retains. Return [`SelectedUpstreamBodyOutcome::Reject`] to
+    /// abort with an error response; the pipeline stops and does not call
+    /// later selected-upstream body filters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if body processing fails. The pipeline
+    /// honors the filter's `failure_mode`: a closed filter's error aborts
+    /// the request, an open filter's error is logged and treated as
+    /// [`SelectedUpstreamBodyOutcome::Continue`].
+    ///
+    /// [`selected_upstream_request_body_access`]: HttpFilter::selected_upstream_request_body_access
+    /// [`SelectedUpstreamBodyOutcome::Reject`]: crate::SelectedUpstreamBodyOutcome::Reject
+    /// [`SelectedUpstreamBodyOutcome::Continue`]: crate::SelectedUpstreamBodyOutcome::Continue
+    async fn on_selected_upstream_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+    ) -> Result<SelectedUpstreamBodyOutcome, FilterError> {
+        let _ = (ctx, body);
+        Ok(SelectedUpstreamBodyOutcome::Continue)
+    }
 }
 
 /// Boxed error type for filter results.
@@ -365,6 +421,11 @@ mod tests {
             "default response body access should be None"
         );
         assert_eq!(
+            filter.selected_upstream_request_body_access(),
+            BodyAccess::None,
+            "default selected-upstream request body access should be None"
+        );
+        assert_eq!(
             filter.request_body_mode(),
             BodyMode::Stream,
             "default request body mode should be Stream"
@@ -380,8 +441,6 @@ mod tests {
         );
     }
 
-    /// The empty default is what makes `referenced_files` additive: a filter that
-    /// predates it declares nothing.
     #[test]
     fn default_referenced_files_is_empty() {
         let filter = MinimalFilter;
@@ -426,6 +485,15 @@ mod tests {
         assert!(
             matches!(response_action, FilterAction::Continue),
             "default on_response_body should return Continue"
+        );
+
+        let selected_action = filter
+            .on_selected_upstream_request_body(&mut ctx, &mut body)
+            .await
+            .unwrap();
+        assert!(
+            matches!(selected_action, SelectedUpstreamBodyOutcome::Continue),
+            "default on_selected_upstream_request_body should return Continue"
         );
         assert_eq!(
             body.as_deref(),

@@ -6,10 +6,7 @@
 
 use std::sync::Arc;
 
-use praxis_core::{
-    config::SimpleStrategy,
-    health::{ClusterHealthState, EndpointHealth},
-};
+use praxis_core::{config::SimpleStrategy, health::ClusterHealthState};
 
 use super::{
     endpoint::WeightedEndpoint,
@@ -38,8 +35,8 @@ struct PriorityTier {
     /// Strategy for this tier's endpoints.
     strategy: Box<Strategy>,
 
-    /// Endpoint indices in the health state for capacity calculation.
-    indices: Vec<usize>,
+    /// Endpoint addresses in this tier, for health-based capacity calculation.
+    addresses: Vec<Arc<str>>,
 }
 
 impl PriorityLevels {
@@ -58,9 +55,9 @@ impl PriorityLevels {
         let tiers: Vec<PriorityTier> = tier_map
             .into_values()
             .map(|tier_eps| {
-                let indices: Vec<usize> = tier_eps.iter().map(|ep| ep.index).collect();
+                let addresses: Vec<Arc<str>> = tier_eps.iter().map(|ep| Arc::clone(&ep.address)).collect();
                 let strategy = Box::new(build_simple_strategy(inner_strategy, tier_eps));
-                PriorityTier { strategy, indices }
+                PriorityTier { strategy, addresses }
             })
             .collect();
 
@@ -111,7 +108,7 @@ impl PriorityLevels {
     /// A tier has capacity if its healthy endpoint ratio exceeds the
     /// overprovisioning threshold: `healthy% >= 100 / overprovisioning_factor`.
     fn tier_has_capacity(&self, tier: &PriorityTier, health: Option<&ClusterHealthState>) -> bool {
-        let total_count = tier.indices.len();
+        let total_count = tier.addresses.len();
         if total_count == 0 {
             return false;
         }
@@ -132,11 +129,11 @@ impl PriorityLevels {
     /// when no health state is available.
     fn tier_healthy_count(tier: &PriorityTier, health: Option<&ClusterHealthState>) -> usize {
         let Some(state) = health else {
-            return tier.indices.len();
+            return tier.addresses.len();
         };
-        tier.indices
+        tier.addresses
             .iter()
-            .filter(|&&idx| state.endpoints().get(idx).is_some_and(EndpointHealth::is_healthy))
+            .filter(|addr| state.is_address_healthy(addr))
             .count()
     }
 }
@@ -157,17 +154,17 @@ impl PriorityLevels {
 mod tests {
     use std::collections::HashSet;
 
-    use praxis_core::health::ClusterHealthEntry;
+    use praxis_core::health::{ClusterHealthEntry, EndpointHealth};
 
     use super::*;
 
     #[test]
     fn uses_primary_tier_when_healthy() {
         let endpoints = vec![
-            ep("10.0.0.1:80", 0, 0),
-            ep("10.0.0.2:80", 1, 0),
-            ep("10.0.0.3:80", 2, 1),
-            ep("10.0.0.4:80", 3, 1),
+            ep("10.0.0.1:80", 0),
+            ep("10.0.0.2:80", 0),
+            ep("10.0.0.3:80", 1),
+            ep("10.0.0.4:80", 1),
         ];
         let pl = PriorityLevels::new(endpoints, &SimpleStrategy::RoundRobin, 140);
 
@@ -184,17 +181,16 @@ mod tests {
     #[test]
     fn spills_to_failover_when_primary_degraded() {
         let endpoints = vec![
-            ep("10.0.0.1:80", 0, 0),
-            ep("10.0.0.2:80", 1, 0),
-            ep("10.0.0.3:80", 2, 1),
-            ep("10.0.0.4:80", 3, 1),
+            ep("10.0.0.1:80", 0),
+            ep("10.0.0.2:80", 0),
+            ep("10.0.0.3:80", 1),
+            ep("10.0.0.4:80", 1),
         ];
         let pl = PriorityLevels::new(endpoints, &SimpleStrategy::RoundRobin, 140);
 
         let state = health_state(4);
         state.endpoints()[0].mark_unhealthy();
         state.endpoints()[1].mark_unhealthy();
-        // Primary tier: 0/2 healthy = 0% < 71% → spill
 
         let mut seen = HashSet::new();
         for _ in 0..10 {
@@ -209,15 +205,11 @@ mod tests {
     #[test]
     fn panic_mode_prefers_tier_with_healthy_endpoints() {
         let endpoints = vec![
-            ep("10.0.0.1:80", 0, 0),
-            ep("10.0.0.2:80", 1, 0),
-            ep("10.0.0.3:80", 2, 1),
-            ep("10.0.0.4:80", 3, 1),
+            ep("10.0.0.1:80", 0),
+            ep("10.0.0.2:80", 0),
+            ep("10.0.0.3:80", 1),
+            ep("10.0.0.4:80", 1),
         ];
-        // Factor 400 → threshold 25%; tier 1 with 1/2 healthy (50%) passes it,
-        // so raise the bar: factor 100 → threshold 100%. Tier 0 has 0/2 and
-        // tier 1 has 1/2 healthy: no tier meets capacity, but panic mode must
-        // still prefer tier 1's healthy endpoint over dead tier 0.
         let pl = PriorityLevels::new(endpoints, &SimpleStrategy::RoundRobin, 100);
 
         let state = health_state(4);
@@ -238,17 +230,15 @@ mod tests {
     #[test]
     fn stays_primary_when_above_threshold() {
         let endpoints = vec![
-            ep("10.0.0.1:80", 0, 0),
-            ep("10.0.0.2:80", 1, 0),
-            ep("10.0.0.3:80", 2, 0),
-            ep("10.0.0.4:80", 3, 1),
+            ep("10.0.0.1:80", 0),
+            ep("10.0.0.2:80", 0),
+            ep("10.0.0.3:80", 0),
+            ep("10.0.0.4:80", 1),
         ];
-        // overprovisioning=200 → threshold is 100/200 = 50%
         let pl = PriorityLevels::new(endpoints, &SimpleStrategy::RoundRobin, 200);
 
         let state = health_state(4);
         state.endpoints()[0].mark_unhealthy();
-        // Primary: 2/3 healthy = 66% >= 50% → stay
 
         let mut seen = HashSet::new();
         for _ in 0..20 {
@@ -263,19 +253,12 @@ mod tests {
 
     #[test]
     fn multiple_failover_tiers() {
-        let endpoints = vec![
-            ep("10.0.0.1:80", 0, 0),
-            ep("10.0.0.2:80", 1, 1),
-            ep("10.0.0.3:80", 2, 2),
-        ];
+        let endpoints = vec![ep("10.0.0.1:80", 0), ep("10.0.0.2:80", 1), ep("10.0.0.3:80", 2)];
         let pl = PriorityLevels::new(endpoints, &SimpleStrategy::RoundRobin, 140);
 
         let state = health_state(3);
         state.endpoints()[0].mark_unhealthy();
         state.endpoints()[1].mark_unhealthy();
-        // Tier 0: 0/1 healthy → spill
-        // Tier 1: 0/1 healthy → spill
-        // Tier 2: 1/1 healthy → use
 
         let addr = pl.select(None, Some(&state), &[]).unwrap();
         assert_eq!(&*addr, "10.0.0.3:80", "should reach third-priority tier");
@@ -283,11 +266,7 @@ mod tests {
 
     #[test]
     fn all_same_priority_acts_as_single_tier() {
-        let endpoints = vec![
-            ep("10.0.0.1:80", 0, 0),
-            ep("10.0.0.2:80", 1, 0),
-            ep("10.0.0.3:80", 2, 0),
-        ];
+        let endpoints = vec![ep("10.0.0.1:80", 0), ep("10.0.0.2:80", 0), ep("10.0.0.3:80", 0)];
         let pl = PriorityLevels::new(endpoints, &SimpleStrategy::RoundRobin, 140);
 
         let mut seen = HashSet::new();
@@ -307,10 +286,9 @@ mod tests {
     // Test Utilities
     // -------------------------------------------------------------------------
 
-    fn ep(addr: &str, index: usize, priority: u32) -> WeightedEndpoint {
+    fn ep(addr: &str, priority: u32) -> WeightedEndpoint {
         WeightedEndpoint {
             address: Arc::from(addr),
-            index,
             weight: 1,
             metadata: std::collections::HashMap::new(),
             priority,

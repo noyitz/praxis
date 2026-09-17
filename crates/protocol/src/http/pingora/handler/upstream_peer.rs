@@ -14,7 +14,10 @@ use std::{
     time::Instant,
 };
 
-use pingora_core::{Result, upstreams::peer::HttpPeer};
+use pingora_core::{
+    Result,
+    upstreams::peer::{HttpPeer, HttpUpstreamRequestPolicy},
+};
 use praxis_core::connectivity::{Upstream, peer as peer_utils};
 use tracing::debug;
 
@@ -142,6 +145,13 @@ pub(super) async fn execute(ctx: &mut PingoraRequestCtx) -> Result<Box<HttpPeer>
         ctx.upstream_for_retry = upstream;
     }
 
+    if ctx.upstream_for_retry.is_some() {
+        // Record that a peer was resolved for this attempt. Sticky for the
+        // request: a later retry that clears upstream_for_retry to force
+        // reselection must not erase the "upstream was contacted" signal that
+        // response-phase health accounting relies on.
+        ctx.upstream_contacted = true;
+    }
     let upstream = ctx.upstream_for_retry.as_ref().ok_or_else(|| {
         let cluster = &ctx.cluster;
         pingora_core::Error::explain(
@@ -192,8 +202,7 @@ fn apply_per_try_timeout(ctx: &PingoraRequestCtx, upstream: &mut Upstream) {
 /// Parse the upstream address and build an [`HttpPeer`] with TLS/SNI config.
 ///
 /// TLS certificates are already pre-parsed in the [`CachedClusterTls`]
-/// attached to the upstream. This function converts the cached DER
-/// bytes into Pingora types without any filesystem I/O.
+/// attached to the upstream.
 ///
 /// When `sni` is `None`, derives it from the upstream address hostname
 /// (unless it is an IP address).
@@ -221,6 +230,14 @@ async fn build_peer(upstream: &Upstream, allow_private: bool) -> Result<Box<Http
         });
 
     let mut peer = HttpPeer::new(addr, tls_enabled, sni);
+    // Pingora 0.9.0 sanitizes the upstream request (removing headers a client
+    // nominated in `Connection`) *before* our `upstream_request_filter` runs, and
+    // its protected set omits RFC 7239 `Forwarded` — so a client sending
+    // `Connection: forwarded` would strip the proxy-injected Forwarded header.
+    // `preserve()` disables that pass, keeping Praxis's own hop-by-hop and
+    // Connection-token stripping (which protects `forwarded`, `x-forwarded-*`,
+    // `host`, ...) as the sole authority, as it was before the 0.9.0 bump.
+    peer.options.http_upstream_request_policy = HttpUpstreamRequestPolicy::preserve();
     peer_utils::apply_connection_options(&mut peer, &upstream.connection);
 
     if let Some(tls) = &upstream.tls {
@@ -237,9 +254,9 @@ async fn build_peer(upstream: &Upstream, allow_private: bool) -> Result<Box<Http
 /// Resolve an upstream address to a [`SocketAddr`] with caching and a
 /// private/reserved-range check.
 ///
-/// Tries direct [`SocketAddr`] parsing first (no allocation, no I/O).
-/// For hostname addresses, checks a process-wide cache (60 s TTL)
-/// before falling back to DNS via [`spawn_blocking`].
+/// Tries direct [`SocketAddr`] parsing first. For hostname addresses,
+/// checks a process-wide cache (60 s TTL) before falling back to DNS
+/// via [`spawn_blocking`].
 ///
 /// When DNS returns multiple records, prefers IPv4 to avoid
 /// connectivity issues in dual-stack environments.
@@ -437,8 +454,6 @@ mod tests {
             eprintln!("skipping: localhost did not resolve in this environment");
             return;
         }
-        // The config-time check passes a hostname that resolved publicly;
-        // this is the runtime half that must refuse the rebound answer.
         let err = build_peer(&make_upstream("localhost:8080"), false)
             .await
             .expect_err("a hostname resolving to loopback must be refused by default");
@@ -459,7 +474,6 @@ mod tests {
             eprintln!("skipping: localhost did not resolve in this environment");
             return;
         }
-        // No pinned pipeline means no override, so the check must fail closed.
         let mut ctx = PingoraRequestCtx::default();
         ctx.upstream = Some(make_upstream("localhost:8080"));
         let err = execute(&mut ctx)
@@ -518,24 +532,18 @@ mod tests {
         );
         let health: ClusterHealthState = Arc::new(entry);
 
-        // A reselection to the second endpoint must re-point the
-        // passive-health index at it, or the final outcome is
-        // credited/faulted against the originally selected endpoint.
         assert_eq!(
             reselected_endpoint_index(Some(&health), "127.0.0.1:3002"),
             1,
             "reselection must resolve the reselected address's index"
         );
 
-        // An address the registry does not know maps to usize::MAX, which
-        // makes record_passive_health a no-op instead of a wrong attribution.
         assert_eq!(
             reselected_endpoint_index(Some(&health), "10.0.0.9:9999"),
             usize::MAX,
             "unknown address is a no-op index"
         );
 
-        // No registry at all also degrades to the no-op index.
         assert_eq!(
             reselected_endpoint_index(None, "127.0.0.1:3001"),
             usize::MAX,

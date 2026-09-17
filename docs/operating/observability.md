@@ -376,10 +376,6 @@ increment one series and decrement another, leaving
 both stranded; changing the label set requires a
 restart.
 
-Leaving every dimension enabled (the default) takes
-an allocation-free path through the recorders, so the
-setting costs nothing when unused.
-
 ### Route Label Templating
 
 By default the `route` label is the router's
@@ -415,11 +411,6 @@ Matching rules:
   pattern, or `"unknown"` when no route matched.
   Raw paths are never used as label values.
 
-Templates are compiled at startup and indexed by
-segment count, so matching costs one walk of the
-request's path segments with no allocation and no
-regular expressions.
-
 ### Filter Duration Histograms
 
 Per-filter hook timing is opt-in. Enable it in the
@@ -438,17 +429,21 @@ invocation in seconds.
 | Label | Values |
 | -------- | ------------------------------ |
 | `filter` | Filter name (e.g. `router`, `rate_limiter`, `access_log`) |
-| `phase` | `request` or `response` |
+| `phase` | `request`, `selected_upstream`, or `response` |
 | `stream` | `headers` or `body` |
 
-The four hook combinations are:
+The five hook combinations are:
 
 | Phase + Stream | Hook |
 | -------------------- | -------------------- |
 | `request` + `headers` | `on_request` |
 | `request` + `body` | `on_request_body` |
+| `selected_upstream` + `body` | `on_selected_upstream_request_body` |
 | `response` + `headers` | `on_response` |
 | `response` + `body` | `on_response_body` |
+
+`selected_upstream` pairs only with `body`; the phase
+has no header hook.
 
 Enabling `filter_duration` without `admin.address`
 records metrics internally but does not expose them.

@@ -35,9 +35,9 @@ pub(super) async fn dispose_session_abnormal(
     }
 }
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // SubResponseBody
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
 impl SubResponseBody {
     /// Create a body in the completed state (for header-time completion).
@@ -71,6 +71,17 @@ impl SubResponseBody {
     /// Number of chunks received so far.
     pub fn chunk_count(&self) -> u64 {
         self.chunk_count
+    }
+
+    /// Cap the next per-chunk read wait at `timeout`.
+    ///
+    /// Dispatch snapshots the peer `read_timeout` into this body. A
+    /// response-body filter can recap leftover budget on `ctx.upstream`;
+    /// the streaming executor then copies that cap here so the next
+    /// [`next_chunk`](Self::next_chunk) uses remaining time instead of
+    /// restarting the original per-read timer.
+    pub fn cap_read_timeout(&mut self, timeout: Duration) {
+        self.read_timeout = Some(self.read_timeout.map_or(timeout, |existing| existing.min(timeout)));
     }
 
     /// Pull the next body chunk from the upstream.

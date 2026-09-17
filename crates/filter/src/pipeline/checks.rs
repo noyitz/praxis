@@ -20,7 +20,10 @@ use praxis_core::config::{Condition, FailureMode, FilterEntry};
 use tracing::warn;
 
 use super::{branch::RejoinTarget, filter::PipelineFilter};
-use crate::{any_filter::AnyFilter, body::BodyAccess};
+use crate::{
+    any_filter::AnyFilter,
+    body::{BodyAccess, BodyMode},
+};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -37,7 +40,7 @@ const REWRITE_FILTERS: &[&str] = &["path_rewrite", "url_rewrite"];
 /// name.
 ///
 /// Such a name can never equal a real request header, so the filter would be
-/// silently skipped forever — the same fail-open footgun this validation
+/// silently skipped forever, the same fail-open footgun this validation
 /// exists to prevent. Failing at build turns it into a clear config error.
 pub(super) fn check_condition_header_names(filters: &[PipelineFilter], errors: &mut Vec<String>) {
     for pf in filters {
@@ -312,14 +315,14 @@ pub(super) fn check_misaligned_clusters(filters: &[PipelineFilter], errors: &mut
 /// Check each branch sub-chain's cluster demands against its availability.
 ///
 /// A branch's available load balancers are those inherited from enclosing
-/// scopes plus the load balancers *guaranteed to run* within the branch —
+/// scopes plus the load balancers *guaranteed to run* within the branch:
 /// its own level plus any unconditional sub-branches on unconditional hosts
 /// (see [`reachable_lb_clusters`]). A *conditional* nested branch's load
 /// balancer is excluded: it only runs when that nested branch fires, so
 /// counting it here would hide the same guaranteed-502 shape one level down.
 /// The empty-LB escape is pipeline-global (`any_lb`), matching the top-level
 /// check: only a pipeline with no load balancer anywhere (static upstream)
-/// skips demand validation — a branch whose local availability happens to be
+/// skips demand validation; a branch whose local availability happens to be
 /// empty is still checked.
 ///
 /// [`reachable_lb_clusters`]: super::clusters::reachable_lb_clusters
@@ -423,8 +426,8 @@ pub(super) fn check_skip_to_bypasses_security(filters: &[PipelineFilter], errors
 /// When a branch rejoins at `Terminal` and its sub-chain selects a cluster,
 /// the pipeline forwards the request upstream immediately, skipping every
 /// top-level filter after the branch's host filter. A security filter placed
-/// after such a branch is silently bypassed for requests that take the branch
-/// — the same hazard [`check_skip_to_bypasses_security`] guards for `SkipTo`.
+/// after such a branch is silently bypassed for requests that take the branch,
+/// the same hazard [`check_skip_to_bypasses_security`] guards for `SkipTo`.
 pub(super) fn check_terminal_rejoin_bypasses_security(filters: &[PipelineFilter], errors: &mut Vec<String>) {
     // Tracks whether any filter up to and including the branch host can
     // select a cluster. The runtime forwards a Terminal branch upstream
@@ -501,6 +504,88 @@ fn collect_branch_body_errors(branch_name: &str, filters: &[PipelineFilter], err
         }
         for branch in &pf.branches {
             collect_branch_body_errors(&branch.name, &branch.filters, errors);
+        }
+    }
+}
+
+/// Selected-upstream body-access filters inside branch chains.
+///
+/// The selected-upstream request-body phase, like the request- and
+/// response-body phases, only runs top-level filters: branch sub-chains
+/// run `on_request` only, so a filter declaring
+/// [`selected_upstream_request_body_access`] inside a branch would
+/// silently enable buffering for a hook that never runs. The existing
+/// [`check_branch_body_filters`] does not catch it (a filter can declare
+/// selected-upstream access with no request/response body access), so this
+/// is a distinct check. Move such a filter to the main pipeline path or
+/// gate it with filter conditions.
+///
+/// [`selected_upstream_request_body_access`]: crate::HttpFilter::selected_upstream_request_body_access
+pub(super) fn check_branch_selected_upstream_body_filters(filters: &[PipelineFilter], errors: &mut Vec<String>) {
+    for pf in filters {
+        for branch in &pf.branches {
+            collect_branch_selected_upstream_body_errors(&branch.name, &branch.filters, errors);
+        }
+    }
+}
+
+/// Recursively collect selected-upstream body-access violations inside one
+/// branch sub-chain.
+fn collect_branch_selected_upstream_body_errors(
+    branch_name: &str,
+    filters: &[PipelineFilter],
+    errors: &mut Vec<String>,
+) {
+    for pf in filters {
+        if let AnyFilter::Http(filter) = &pf.filter
+            && filter.selected_upstream_request_body_access() != BodyAccess::None
+        {
+            errors.push(format!(
+                "filter '{name}' in branch '{branch_name}' declares \
+                 selected-upstream request body access, but branch filters \
+                 only run on_request and body hooks never execute; move it \
+                 to the main pipeline or gate it with filter conditions",
+                name = filter.name(),
+            ));
+        }
+        for branch in &pf.branches {
+            collect_branch_selected_upstream_body_errors(&branch.name, &branch.filters, errors);
+        }
+    }
+}
+
+/// Selected-upstream body participants must buffer the full body.
+///
+/// A filter that participates in the selected-upstream request-body phase
+/// runs against the complete request body, which requires a bounded
+/// [`BodyMode::StreamBuffer`] delivery mode. Reject a participant whose
+/// [`request_body_mode`] is `Stream`, `SizeLimit`, or an unbounded
+/// `StreamBuffer`: an unbuffered mode would starve the phase and an
+/// unbounded buffer is an unbounded-memory footgun. Capability computation
+/// defensively promotes such declarations to a bounded buffer, but the
+/// operator's intent is still a misconfiguration worth surfacing.
+///
+/// [`BodyMode::StreamBuffer`]: crate::BodyMode::StreamBuffer
+/// [`request_body_mode`]: crate::HttpFilter::request_body_mode
+pub(super) fn check_selected_upstream_body_mode(filters: &[PipelineFilter], errors: &mut Vec<String>) {
+    for pf in filters {
+        let AnyFilter::Http(filter) = &pf.filter else {
+            continue;
+        };
+        if filter.selected_upstream_request_body_access() == BodyAccess::None {
+            continue;
+        }
+        if !matches!(
+            filter.request_body_mode(),
+            BodyMode::StreamBuffer { max_bytes: Some(_) }
+        ) {
+            errors.push(format!(
+                "filter '{name}' participates in the selected-upstream request \
+                 body phase but its request_body_mode is not a bounded \
+                 StreamBuffer; declare request_body_mode = StreamBuffer with a \
+                 max_bytes limit",
+                name = filter.name(),
+            ));
         }
     }
 }
@@ -1026,9 +1111,6 @@ mod tests {
 
     #[test]
     fn open_security_filter_nested_in_branch_errors() {
-        // A security filter with failure_mode: open buried inside a branch
-        // sub-chain must be held to the same guardrail as a top-level one; branch
-        // nesting must not silently defeat the check.
         let names = vec!["headers"];
         let mut nested = security_noop_filter("ip_acl", vec![]);
         nested.failure_mode = FailureMode::Open;
@@ -1049,8 +1131,6 @@ mod tests {
 
     #[test]
     fn open_security_filter_nested_in_branch_allowed_demotes_to_warning() {
-        // The insecure_options opt-out must apply to branch-nested security
-        // filters exactly as it does at the top level.
         let names = vec!["headers"];
         let mut nested = security_noop_filter("ip_acl", vec![]);
         nested.failure_mode = FailureMode::Open;
@@ -1065,8 +1145,6 @@ mod tests {
 
     #[test]
     fn open_security_filter_nested_two_levels_deep_errors() {
-        // The recursion must reach a security filter buried inside a branch of a
-        // branch, not just a first-level branch.
         let names = vec!["headers"];
         let mut deep = security_noop_filter("ip_acl", vec![]);
         deep.failure_mode = FailureMode::Open;
@@ -1488,12 +1566,6 @@ mod tests {
 
     #[test]
     fn unconditional_branch_lb_satisfies_top_level_selection() {
-        // An unconditional branch on an unconditional host always runs and its
-        // filters share `ctx`, so the branch LB sets `ctx.upstream` for the
-        // top-level selection exactly like a top-level LB (verified against the
-        // runtime: evaluate.rs runs branch filters on the shared ctx, and the
-        // trailing lb(other) early-returns once ctx.upstream is set). This
-        // config succeeds at runtime, so it must NOT be rejected at build time.
         let filters = vec![
             selector_filter("router", &["x"]),
             host_with_branch(vec![lb_filter(&["x"])]),
@@ -1509,10 +1581,6 @@ mod tests {
 
     #[test]
     fn conditional_branch_lb_does_not_satisfy_top_level_selection() {
-        // A CONDITIONAL branch may not fire; when it does not, the top-level
-        // selection of "x" reaches the trailing lb(other), which does not
-        // define "x", and the request 502s. The branch LB therefore cannot be
-        // relied on to satisfy the selection, so this must error.
         let filters = vec![
             selector_filter("router", &["x"]),
             host_with_conditional_branch(vec![lb_filter(&["x"])]),
@@ -1534,8 +1602,6 @@ mod tests {
 
     #[test]
     fn branch_selection_without_any_visible_lb_errors() {
-        // A router inside a branch demanding a cluster no visible LB defines
-        // is the guaranteed request-time 502 this check exists to catch.
         let filters = vec![
             host_with_branch(vec![selector_filter("router", &["y"])]),
             lb_filter(&["other"]),
@@ -1570,9 +1636,6 @@ mod tests {
 
     #[test]
     fn top_level_selection_with_only_unconditional_branch_lb_no_error() {
-        // No top-level LB exists, but the only LB lives in an UNCONDITIONAL
-        // branch, which always runs and serves the top-level selection at
-        // runtime. It must NOT error.
         let filters = vec![
             selector_filter("router", &["x"]),
             host_with_branch(vec![lb_filter(&["x"])]),
@@ -1587,9 +1650,6 @@ mod tests {
 
     #[test]
     fn top_level_selection_with_only_conditional_branch_lb_errors() {
-        // The pipeline's only LB lives in a CONDITIONAL branch that may not
-        // fire; a non-matching request then forwards with no upstream selected
-        // and 502s. The whole-pipeline escape must not skip this.
         let filters = vec![
             selector_filter("router", &["x"]),
             host_with_conditional_branch(vec![lb_filter(&["x"])]),
@@ -1605,10 +1665,6 @@ mod tests {
 
     #[test]
     fn branch_demand_served_by_unconditional_nested_branch_lb_no_error() {
-        // The demand sits at branch level and the LB defining its cluster is
-        // inside an UNCONDITIONAL nested branch on an unconditional host. That
-        // nested branch always runs when the outer branch runs, so lb(deep) is
-        // reachable and the request succeeds. It must NOT error.
         let mut nested_host = noop_filter_with_conditions("headers", vec![]);
         nested_host.branches = vec![ResolvedBranch {
             condition: None,
@@ -1631,10 +1687,6 @@ mod tests {
 
     #[test]
     fn branch_demand_served_only_by_conditional_nested_branch_lb_errors() {
-        // The LB defining "deep" is inside a CONDITIONAL nested branch that may
-        // not fire, so the branch-level selection of "deep" can reach
-        // forwarding with no upstream selected. This is the guaranteed-502
-        // shape one level down and must error.
         let mut nested_host = noop_filter_with_conditions("headers", vec![]);
         nested_host.branches = vec![ResolvedBranch {
             condition: Some(crate::pipeline::branch::ResolvedBranchCondition {
@@ -1667,10 +1719,6 @@ mod tests {
 
     #[test]
     fn nested_unconditional_branch_lb_without_outer_lb_no_error() {
-        // The pipeline's only LB sits in an UNCONDITIONAL nested branch and
-        // there is no top-level LB. The nested branch always runs, so lb(deep)
-        // is reachable and the branch selection of "deep" succeeds at runtime.
-        // It must NOT error.
         let mut nested_host = noop_filter_with_conditions("headers", vec![]);
         nested_host.branches = vec![ResolvedBranch {
             condition: None,
@@ -1693,10 +1741,6 @@ mod tests {
 
     #[test]
     fn nested_conditional_branch_lb_without_outer_lb_still_errors() {
-        // The pipeline's only LB sits in a CONDITIONAL nested branch and there
-        // is no top-level LB. The empty-LB escape is pipeline-global, so the
-        // branch demand is still validated and rejected: the nested LB only
-        // runs when the nested branch fires.
         let mut nested_host = noop_filter_with_conditions("headers", vec![]);
         nested_host.branches = vec![ResolvedBranch {
             condition: Some(crate::pipeline::branch::ResolvedBranchCondition {
@@ -1729,8 +1773,6 @@ mod tests {
 
     #[test]
     fn self_contained_branch_selection_no_error() {
-        // A branch that both selects and defines its own cluster is complete
-        // on its own; the top level must not be required to re-define it.
         let filters = vec![
             selector_filter("router", &["web"]),
             host_with_branch(vec![selector_filter("router", &["z"]), lb_filter(&["z"])]),
@@ -1940,6 +1982,152 @@ mod tests {
     }
 
     #[test]
+    fn branch_selected_upstream_body_filter_errors() {
+        let mut parent = named_noop_filter("headers", vec![]);
+        parent.branches = vec![make_branch_with_filters(
+            "sel_branch",
+            vec![selected_upstream_filter(
+                BodyAccess::ReadWrite,
+                BodyMode::StreamBuffer { max_bytes: Some(4096) },
+            )],
+        )];
+        let filters = vec![parent];
+        let mut errors = Vec::new();
+        check_branch_selected_upstream_body_filters(&filters, &mut errors);
+        assert_eq!(errors.len(), 1, "selected-upstream body filter in branch should error");
+        assert!(
+            errors[0].contains("sel_branch") && errors[0].contains("selected_body"),
+            "error should name the branch and the filter: {}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn nested_branch_selected_upstream_body_filter_errors() {
+        let mut inner_parent = named_noop_filter("classifier", vec![]);
+        inner_parent.branches = vec![make_branch_with_filters(
+            "inner",
+            vec![selected_upstream_filter(
+                BodyAccess::ReadOnly,
+                BodyMode::StreamBuffer { max_bytes: Some(4096) },
+            )],
+        )];
+        let mut parent = named_noop_filter("headers", vec![]);
+        parent.branches = vec![make_branch_with_filters("outer", vec![inner_parent])];
+        let filters = vec![parent];
+        let mut errors = Vec::new();
+        check_branch_selected_upstream_body_filters(&filters, &mut errors);
+        assert_eq!(
+            errors.len(),
+            1,
+            "nested branch selected-upstream body filter should error"
+        );
+        assert!(
+            errors[0].contains("inner"),
+            "error should name the innermost branch: {}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn branch_without_selected_upstream_body_filters_no_error() {
+        let mut parent = named_noop_filter("headers", vec![]);
+        parent.branches = vec![make_branch_with_filters(
+            "noop_branch",
+            vec![named_noop_filter("request_id", vec![])],
+        )];
+        let filters = vec![parent];
+        let mut errors = Vec::new();
+        check_branch_selected_upstream_body_filters(&filters, &mut errors);
+        assert!(
+            errors.is_empty(),
+            "branch without selected-upstream body filters should not error"
+        );
+    }
+
+    #[test]
+    fn top_level_selected_upstream_body_filter_no_branch_error() {
+        let filters = vec![selected_upstream_filter(
+            BodyAccess::ReadWrite,
+            BodyMode::StreamBuffer { max_bytes: Some(4096) },
+        )];
+        let mut errors = Vec::new();
+        check_branch_selected_upstream_body_filters(&filters, &mut errors);
+        assert!(
+            errors.is_empty(),
+            "top-level selected-upstream body filters are legitimate"
+        );
+    }
+
+    #[test]
+    fn selected_upstream_body_mode_rejects_stream() {
+        let filters = vec![selected_upstream_filter(BodyAccess::ReadOnly, BodyMode::Stream)];
+        let mut errors = Vec::new();
+        check_selected_upstream_body_mode(&filters, &mut errors);
+        assert_eq!(
+            errors.len(),
+            1,
+            "Stream mode should be rejected for a selected participant"
+        );
+        assert!(
+            errors[0].contains("selected_body") && errors[0].contains("bounded"),
+            "error should name the filter and require a bounded buffer: {}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn selected_upstream_body_mode_rejects_unbounded_stream_buffer() {
+        let filters = vec![selected_upstream_filter(
+            BodyAccess::ReadOnly,
+            BodyMode::StreamBuffer { max_bytes: None },
+        )];
+        let mut errors = Vec::new();
+        check_selected_upstream_body_mode(&filters, &mut errors);
+        assert_eq!(errors.len(), 1, "unbounded StreamBuffer should be rejected");
+    }
+
+    #[test]
+    fn selected_upstream_body_mode_rejects_size_limit() {
+        let filters = vec![selected_upstream_filter(
+            BodyAccess::ReadOnly,
+            BodyMode::SizeLimit { max_bytes: 4096 },
+        )];
+        let mut errors = Vec::new();
+        check_selected_upstream_body_mode(&filters, &mut errors);
+        assert_eq!(
+            errors.len(),
+            1,
+            "SizeLimit mode should be rejected for a selected participant"
+        );
+    }
+
+    #[test]
+    fn selected_upstream_body_mode_accepts_bounded_stream_buffer() {
+        let filters = vec![selected_upstream_filter(
+            BodyAccess::ReadWrite,
+            BodyMode::StreamBuffer { max_bytes: Some(4096) },
+        )];
+        let mut errors = Vec::new();
+        check_selected_upstream_body_mode(&filters, &mut errors);
+        assert!(
+            errors.is_empty(),
+            "bounded StreamBuffer is the required mode: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn selected_upstream_body_mode_ignores_non_participants() {
+        let filters = vec![body_filter()];
+        let mut errors = Vec::new();
+        check_selected_upstream_body_mode(&filters, &mut errors);
+        assert!(
+            errors.is_empty(),
+            "non-participants must not be checked for the bounded buffer requirement"
+        );
+    }
+
+    #[test]
     fn irr_with_router_errors() {
         let names = vec!["iterative_request_router", "router"];
         let mut errors = Vec::new();
@@ -2089,6 +2277,45 @@ mod tests {
         PipelineFilter::new(0, AnyFilter::Http(Box::new(BranchBodyFilter)), vec![], vec![])
     }
 
+    /// Build a [`PipelineFilter`] whose filter participates in the
+    /// selected-upstream request-body phase with the given access and mode.
+    fn selected_upstream_filter(access: BodyAccess, mode: BodyMode) -> PipelineFilter {
+        /// Minimal filter declaring selected-upstream request body access.
+        struct SelectedBodyFilter {
+            access: BodyAccess,
+            mode: BodyMode,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::filter::HttpFilter for SelectedBodyFilter {
+            fn name(&self) -> &'static str {
+                "selected_body"
+            }
+
+            async fn on_request(
+                &self,
+                _ctx: &mut crate::HttpFilterContext<'_>,
+            ) -> Result<crate::FilterAction, crate::FilterError> {
+                Ok(crate::FilterAction::Continue)
+            }
+
+            fn selected_upstream_request_body_access(&self) -> BodyAccess {
+                self.access
+            }
+
+            fn request_body_mode(&self) -> BodyMode {
+                self.mode
+            }
+        }
+
+        PipelineFilter::new(
+            0,
+            AnyFilter::Http(Box::new(SelectedBodyFilter { access, mode })),
+            vec![],
+            vec![],
+        )
+    }
+
     /// Build a [`PipelineFilter`] whose filter selects a cluster.
     fn cluster_selecting_filter() -> PipelineFilter {
         /// Minimal filter that reports it selects a cluster.
@@ -2167,10 +2394,6 @@ mod tests {
 
     #[test]
     fn terminal_branch_after_upstream_selector_errors() {
-        // The branch sub-chain selects nothing, but a router earlier in the
-        // pipeline already set the cluster, so at runtime the Terminal branch
-        // forwards upstream and bypasses the later security filter all the
-        // same.
         let selector = cluster_selecting_filter();
         let mut host = named_noop_filter("classifier", vec![]);
         host.branches = vec![make_terminal_branch(
@@ -2195,10 +2418,6 @@ mod tests {
 
     #[test]
     fn terminal_branch_after_earlier_branch_selector_errors() {
-        // The selector lives inside an EARLIER host's Next-rejoin branch: a
-        // request taking that branch has ctx.cluster set when it reaches the
-        // later host's empty Terminal branch, which then forwards upstream
-        // past ip_acl.
         let mut selector_host = named_noop_filter("classifier", vec![]);
         selector_host.branches = vec![ResolvedBranch {
             condition: None,
@@ -2230,7 +2449,6 @@ mod tests {
         let ip_acl = security_noop_filter("ip_acl", vec![]);
         let mut host = named_noop_filter("classifier", vec![]);
         host.branches = vec![make_terminal_branch("route", vec![cluster_selecting_filter()])];
-        // ip_acl runs before the routing branch, so it is not bypassed.
         let filters = vec![ip_acl, host];
         let mut errors = Vec::new();
         check_terminal_rejoin_bypasses_security(&filters, &mut errors);

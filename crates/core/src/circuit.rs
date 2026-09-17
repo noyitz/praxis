@@ -15,9 +15,9 @@ use std::{
 
 use dashmap::DashMap;
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // CircuitState
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
 /// The three states of a circuit breaker.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,9 +52,9 @@ impl CircuitState {
     }
 }
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // CircuitCheck / CircuitToken
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
 /// Result of a [`CircuitBreaker::try_acquire`] call.
 pub enum CircuitCheck {
@@ -82,9 +82,9 @@ pub struct CircuitToken {
     generation: u64,
 }
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // CircuitBreakerConfig
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
 /// Configuration for a [`CircuitBreaker`].
 #[derive(Clone, Debug)]
@@ -100,14 +100,13 @@ pub struct CircuitBreakerConfig {
     pub half_open_timeout: Duration,
 }
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // CircuitBreaker
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
 /// Per-peer circuit breaker with generation-bearing tokens.
 ///
-/// Thread-safe via internal [`Mutex`]. The critical section is small
-/// (a few field reads/writes), so contention is negligible.
+/// Thread-safe via internal [`Mutex`].
 #[derive(Debug)]
 pub struct CircuitBreaker {
     /// Guarded interior state.
@@ -345,6 +344,46 @@ impl CircuitBreaker {
         drop(inner);
     }
 
+    /// Release the token's in-flight slot without recording an outcome.
+    ///
+    /// Used when the exchange never reached the upstream (rejected or
+    /// aborted before contact), so the request carries no signal about the
+    /// cluster. The in-flight slot is freed so the breaker can still be
+    /// evicted, but the failure streak and any half-open probe state are
+    /// left untouched: a half-open probe token released this way leaves the
+    /// circuit half-open until its probe timeout re-arms recovery, exactly
+    /// as if the probe were still in flight. Prefer this over dropping the
+    /// token, which would leak the in-flight slot.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[expect(clippy::expect_used, reason = "poisoned mutex is unrecoverable")]
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "takes the token by value like record_success/record_failure; a released token is single-use"
+    )]
+    pub fn release(&self, token: CircuitToken) {
+        // Consume the token so it can never be recorded after release; the
+        // generation is irrelevant here because release updates no stats.
+        let CircuitToken { .. } = token;
+        let mut inner = self.inner.lock().expect("circuit breaker lock poisoned");
+        inner.release_token();
+        self.store_state_cache(&inner);
+        drop(inner);
+    }
+
+    /// In-flight slot count (probes plus admitted requests), for tests.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[cfg(test)]
+    #[expect(clippy::expect_used, reason = "poisoned mutex is unrecoverable")]
+    pub fn in_flight(&self) -> u32 {
+        self.inner.lock().expect("circuit breaker lock poisoned").in_flight
+    }
+
     /// Whether the breaker has no request in flight and has been idle for
     /// at least `idle_threshold`, and is therefore safe to evict.
     ///
@@ -382,10 +421,7 @@ impl CircuitBreaker {
     /// Returns the current state without side effects.
     ///
     /// Used by filter-layer metrics to publish open/closed gauges
-    /// without duplicating the state machine. Reads the lock-free
-    /// mirror written by every mutating critical section, so gauge
-    /// peeks around `try_acquire`/`record_*` do not triple the
-    /// per-request lock count.
+    /// without duplicating the state machine.
     pub fn state(&self) -> CircuitState {
         self.cached_state()
     }
@@ -404,9 +440,9 @@ impl CircuitBreaker {
     }
 }
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // PeerKey
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
 /// Logical identity of an upstream peer for circuit breaker keying.
 ///
@@ -439,9 +475,9 @@ impl std::fmt::Display for PeerKey {
     }
 }
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // CircuitBreakerRegistry
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
 /// Per-peer circuit breaker registry backed by [`DashMap`].
 ///
@@ -544,13 +580,13 @@ impl CircuitBreakerRegistry {
     }
 }
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
-#[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, reason = "tests")]
 mod tests {
     use super::*;
 
@@ -562,7 +598,9 @@ mod tests {
         }
     }
 
-    // --- State machine basics ---
+    // -------------------------------------------------------------------------
+    // State machine basics
+    // -------------------------------------------------------------------------
 
     #[test]
     fn starts_in_closed_state() {
@@ -645,6 +683,29 @@ mod tests {
     }
 
     #[test]
+    fn release_frees_probe_without_resolving_it() {
+        let cb = CircuitBreaker::new(config(1, 0, 9_999_000));
+        let t = cb.try_acquire();
+        record_failure_from_check(&cb, t);
+        let CircuitCheck::Allowed(probe) = cb.try_acquire() else {
+            panic!("half-open should allow a probe");
+        };
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+        assert_eq!(cb.in_flight(), 1, "the half-open probe occupies the in-flight slot");
+        cb.release(probe);
+        assert_eq!(
+            cb.state(),
+            CircuitState::HalfOpen,
+            "releasing an unreached probe must leave the circuit half-open"
+        );
+        assert_eq!(
+            cb.in_flight(),
+            0,
+            "release must free the in-flight slot so the breaker can later be idle-evicted"
+        );
+    }
+
+    #[test]
     fn half_open_allows_only_one_probe() {
         let cb = CircuitBreaker::new(config(1, 0, 9_999_000));
         let t = cb.try_acquire();
@@ -673,7 +734,9 @@ mod tests {
         assert_eq!(cb.state(), CircuitState::Closed);
     }
 
-    // --- Half-open timeout ---
+    // -------------------------------------------------------------------------
+    // Half-open timeout
+    // -------------------------------------------------------------------------
 
     #[test]
     fn half_open_timeout_resets_to_open() {
@@ -695,7 +758,9 @@ mod tests {
         assert_eq!(cb.state(), CircuitState::HalfOpen);
     }
 
-    // --- Generation tracking ---
+    // -------------------------------------------------------------------------
+    // Generation tracking
+    // -------------------------------------------------------------------------
 
     #[test]
     fn stale_probe_success_ignored() {
@@ -740,7 +805,9 @@ mod tests {
         assert_eq!(cb.state(), CircuitState::Open);
     }
 
-    // --- Precheck ---
+    // -------------------------------------------------------------------------
+    // Precheck
+    // -------------------------------------------------------------------------
 
     #[test]
     fn precheck_returns_true_when_closed() {
@@ -792,7 +859,9 @@ mod tests {
         assert_eq!(cb.state(), CircuitState::Open);
     }
 
-    // --- Registry ---
+    // -------------------------------------------------------------------------
+    // Registry
+    // -------------------------------------------------------------------------
 
     fn peer(addr: &str) -> PeerKey {
         PeerKey::new(addr.parse().unwrap(), "")
@@ -843,7 +912,9 @@ mod tests {
         assert!(!registry.precheck(&key), "two failures should trip threshold=2");
     }
 
-    // --- Eviction ---
+    // -------------------------------------------------------------------------
+    // Eviction
+    // -------------------------------------------------------------------------
 
     #[test]
     fn evict_idle_removes_healthy_idle_entries() {
@@ -862,7 +933,6 @@ mod tests {
 
     #[test]
     fn evict_idle_preserves_recently_active_entries() {
-        // A just-touched breaker is never idle, whatever its state.
         let registry = CircuitBreakerRegistry::new(config(1, 9_999_000, 9_999_000));
         let a = peer("127.0.0.1:8080");
         let ta = registry.try_acquire(a.clone());
@@ -876,11 +946,6 @@ mod tests {
 
     #[test]
     fn evict_idle_preserves_open_breaker_inside_recovery_window() {
-        // Callers fast-fail on precheck without reaching try_acquire, so an
-        // Open breaker rejecting a steady stream records no activity. It must
-        // survive its recovery window anyway: evicting it would recreate a
-        // Closed breaker that admits the full stream instead of a single
-        // half-open probe.
         let registry = CircuitBreakerRegistry::new(config(1, 9_999_000, 9_999_000));
         let a = peer("127.0.0.1:8080");
         let ta = registry.try_acquire(a.clone());
@@ -897,10 +962,6 @@ mod tests {
 
     #[test]
     fn evict_idle_removes_open_breaker_past_recovery_window() {
-        // Once the recovery window has elapsed, an idle Open breaker is safe
-        // to evict: a recreated Closed breaker makes the same admission
-        // decision an elapsed window would (admit and re-count failures), and
-        // keeping it would leak registry entries forever under peer churn.
         let registry = CircuitBreakerRegistry::new(config(1, 0, 9_999_000));
         let a = peer("127.0.0.1:8080");
         let ta = registry.try_acquire(a.clone());
@@ -913,10 +974,6 @@ mod tests {
 
     #[test]
     fn evict_idle_preserves_in_flight_entries() {
-        // A request is in flight (token acquired, outcome not yet
-        // recorded). The breaker must not be evicted even past the idle
-        // threshold, or its later failure would be dropped by the
-        // generation mismatch against a recreated breaker.
         let registry = CircuitBreakerRegistry::new(config(3, 30_000, 9_999_000));
         let a = peer("127.0.0.1:8080");
         let ta = registry.try_acquire(a.clone());
@@ -926,8 +983,6 @@ mod tests {
         assert_eq!(evicted, 0, "an in-flight breaker must not be evicted");
         assert_eq!(registry.len(), 1);
 
-        // With the request completed and no other in-flight request, the
-        // now-idle breaker is evictable regardless of its open state.
         record_registry_failure(&registry, &a, ta);
         assert_eq!(
             registry.evict_idle(Duration::ZERO),
@@ -936,12 +991,12 @@ mod tests {
         );
     }
 
-    // --- In-flight tracking ---
+    // -------------------------------------------------------------------------
+    // In-flight tracking
+    // -------------------------------------------------------------------------
 
     #[test]
     fn in_flight_failure_counts_toward_threshold() {
-        // Regression: a slow request whose breaker would previously be
-        // evicted mid-flight must still have its failure recorded.
         let cb = CircuitBreaker::new(config(1, 9_999_000, 9_999_000));
         let check = cb.try_acquire();
         assert!(!cb.is_idle(Duration::ZERO), "in-flight breaker is not idle");
@@ -949,7 +1004,9 @@ mod tests {
         assert_eq!(cb.state(), CircuitState::Open, "the failure must trip the circuit");
     }
 
-    // --- PeerKey ---
+    // -------------------------------------------------------------------------
+    // PeerKey
+    // -------------------------------------------------------------------------
 
     #[test]
     fn peer_key_display_without_sni() {
@@ -963,7 +1020,9 @@ mod tests {
         assert_eq!(key.to_string(), "127.0.0.1:443 (api.example.com)");
     }
 
-    // --- Test Utilities ---
+    // -------------------------------------------------------------------------
+    // Test Utilities
+    // -------------------------------------------------------------------------
 
     fn record_success_from_check(cb: &CircuitBreaker, check: CircuitCheck) {
         if let CircuitCheck::Allowed(token) = check {

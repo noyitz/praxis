@@ -9,9 +9,9 @@ use serde::Deserialize;
 // PolicyFilterConfig
 // -----------------------------------------------------------------------------
 
-/// Configuration block for the experimental `policy` filter, which
-/// embeds the Praxis Policy Engine in-process (gated behind the
-/// `policy-engine` feature, off by default).
+/// Configuration block for the `policy` filter, which embeds the Praxis
+/// Policy Engine in-process (gated behind the `policy-engine` feature,
+/// on by default).
 ///
 /// Praxis filter configs are flat: the filter's typed fields sit
 /// directly under the `- filter:` entry alongside the structural keys
@@ -93,7 +93,7 @@ pub(crate) struct PolicyFilterConfig {
     /// policy never reaches this gate — `on_request_body` returns
     /// `BodyDone` before it, so the flag has no effect there.
     ///
-    /// Note: JSON-RPC methods that legitimately carry no entity (e.g.
+    /// JSON-RPC methods that legitimately carry no entity (e.g.
     /// `tools/list`, `initialize`, `prompts/list`) still pass —
     /// `require_protocol_metadata` only rejects when the metadata is
     /// missing entirely.
@@ -101,8 +101,7 @@ pub(crate) struct PolicyFilterConfig {
     pub require_protocol_metadata: bool,
 }
 
-/// `#[serde(default = ...)]` requires a free function for primitives
-/// without a `Default` impl that returns the desired value.
+/// Default for `require_protocol_metadata`.
 fn default_true() -> bool {
     true
 }

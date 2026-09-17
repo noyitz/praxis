@@ -346,9 +346,27 @@ pub(crate) fn warn_admin_configured_without_feature(config: &Config) {
     }
 }
 
-// ---------------------------------------------------------------------------
+/// Warn when a policy-free build nonetheless carries the `policy` filter.
+///
+/// Cargo unions features across the whole dependency graph, so a crate that
+/// depends on `praxis-proxy-filter` with its defaults enables `policy-engine`
+/// even when this crate's own feature is off. The filter registers on the
+/// filter crate's feature, so `policy` becomes nameable in config in a build
+/// the operator believes is policy-free.
+#[cfg(not(feature = "policy-engine"))]
+pub(crate) fn warn_policy_filter_without_feature(registry: &praxis_filter::FilterRegistry) {
+    if registry.available_filters().contains(&"policy") {
+        tracing::warn!(
+            "this build lacks the `policy-engine` feature but the `policy` filter is registered: a \
+             dependency enabled praxis-proxy-filter's defaults, so this binary is not policy-free. \
+             Run `cargo tree -i praxis-policy` to find the edge that pulls it in"
+        );
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
@@ -537,9 +555,6 @@ mod tests {
         std::fs::write(&cert_path, "fake-cert").expect("write cert");
         std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
 
-        // The client_cert lives on a load_balancer declared inside an INLINE
-        // branch chain — a typed FilterEntry field the raw config walk never
-        // sees. It must warn exactly like a top-level cluster key.
         let config = Config::from_yaml(&format!(
             r#"
 listeners:
@@ -610,9 +625,6 @@ insecure_options:
         std::fs::write(&cert_path, "fake-cert").expect("write cert");
         std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
 
-        // The client cert lives on the typed top-level `clusters:` list, not
-        // inline in a load-balancer filter, exercising the typed loop rather
-        // than the raw-config walk.
         let config = Config::from_yaml(&format!(
             r#"
 listeners:
@@ -762,9 +774,48 @@ insecure_options:
         );
     }
 
-    // -----------------------------------------------------------------------
+    #[cfg(not(feature = "policy-engine"))]
+    #[test]
+    fn a_lean_build_warns_when_the_policy_filter_is_registered_anyway() {
+        let warnings = capture_warnings(|| super::warn_policy_filter_without_feature(&registry_with_policy_filter()));
+        assert_eq!(
+            warnings.len(),
+            1,
+            "a policy-free build carrying the policy filter should warn exactly once, got: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("cargo tree -i praxis-policy"),
+            "the warning must tell the operator how to find the offending edge: {:?}",
+            warnings[0]
+        );
+    }
+
+    #[cfg(not(feature = "policy-engine"))]
+    #[test]
+    fn a_lean_build_without_the_policy_filter_warns_nothing() {
+        let registry = praxis_filter::FilterRegistry::with_builtins();
+        let warnings = capture_warnings(|| super::warn_policy_filter_without_feature(&registry));
+        assert!(
+            warnings.is_empty(),
+            "a genuinely policy-free build should stay quiet, got: {warnings:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
     // Test Utilities
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+
+    /// Registry standing in for a build where feature unification turned the
+    /// `policy` filter on behind this crate's back.
+    #[cfg(not(feature = "policy-engine"))]
+    fn registry_with_policy_filter() -> praxis_filter::FilterRegistry {
+        let mut registry = praxis_filter::FilterRegistry::with_builtins();
+        let factory = praxis_filter::FilterFactory::Http(Arc::new(|_| Err("unused".into())));
+        registry
+            .register("policy", factory)
+            .expect("a lean build must not already carry the policy filter");
+        registry
+    }
 
     /// Exhaustive construction guards against new fields: adding a field to
     /// [`InsecureOptions`] without updating this function causes a compile error,

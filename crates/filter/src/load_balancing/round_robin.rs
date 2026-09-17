@@ -18,10 +18,10 @@ use super::endpoint::WeightedEndpoint;
 
 /// Weighted round-robin selector using cumulative weight buckets.
 pub(crate) struct RoundRobin {
-    /// Deduplicated endpoint list with weights and original indices.
+    /// Deduplicated endpoint list with weights.
     endpoints: Vec<WeightedEndpoint>,
 
-    /// Sum of all endpoint weights (pre-computed, widened to `usize`).
+    /// Sum of all endpoint weights.
     total_weight: usize,
 
     /// Monotonically increasing counter; modulo-selected per call.
@@ -41,10 +41,8 @@ impl RoundRobin {
 
     /// Return the next healthy endpoint address in weighted round-robin order.
     ///
-    /// Computes `counter % total_healthy_weight`, then walks the healthy
-    /// endpoint list to find the matching weight bucket. Falls back to
-    /// all endpoints (panic mode) when every endpoint is unhealthy.
-    /// Endpoints listed in `exclude` are skipped.
+    /// Falls back to all endpoints (panic mode) when every endpoint is
+    /// unhealthy. Endpoints listed in `exclude` are skipped.
     #[inline]
     pub(crate) fn select(&self, health: Option<&ClusterHealthState>, exclude: &[Arc<str>]) -> Option<Arc<str>> {
         if self.total_weight == 0 {
@@ -62,17 +60,12 @@ impl RoundRobin {
     }
 
     /// Attempt weighted selection among only healthy endpoints.
-    ///
-    /// Fast path (common case): when `exclude` is empty, walks healthy endpoints
-    /// with a cumulative-weight loop — zero allocations.
-    /// Slow path (retry case): collects candidates, filters by exclude, then walks.
     #[expect(clippy::too_many_lines, reason = "fast/slow path split is clearer inline")]
-    #[expect(clippy::indexing_slicing, reason = "bounds checked")]
     fn select_healthy(&self, tick: usize, state: &ClusterHealthState, exclude: &[Arc<str>]) -> Option<Arc<str>> {
         if exclude.is_empty() {
             let mut healthy_weight = 0_usize;
             for ep in &self.endpoints {
-                if ep.index < state.endpoints().len() && state.endpoints()[ep.index].is_healthy() {
+                if state.is_address_healthy(&ep.address) {
                     healthy_weight += ep.weight as usize;
                 }
             }
@@ -82,7 +75,7 @@ impl RoundRobin {
             let slot = tick % healthy_weight;
             let mut cumulative = 0_usize;
             for ep in &self.endpoints {
-                if ep.index < state.endpoints().len() && state.endpoints()[ep.index].is_healthy() {
+                if state.is_address_healthy(&ep.address) {
                     cumulative += ep.weight as usize;
                     if slot < cumulative {
                         return Some(Arc::clone(&ep.address));
@@ -95,10 +88,7 @@ impl RoundRobin {
         // Slow path: filter by both health and exclusion list.
         let mut healthy_weight = 0_usize;
         for ep in &self.endpoints {
-            if ep.index < state.endpoints().len()
-                && state.endpoints()[ep.index].is_healthy()
-                && !is_excluded(&ep.address, exclude)
-            {
+            if state.is_address_healthy(&ep.address) && !is_excluded(&ep.address, exclude) {
                 healthy_weight += ep.weight as usize;
             }
         }
@@ -108,10 +98,7 @@ impl RoundRobin {
         let slot = tick % healthy_weight;
         let mut cumulative = 0_usize;
         for ep in &self.endpoints {
-            if ep.index < state.endpoints().len()
-                && state.endpoints()[ep.index].is_healthy()
-                && !is_excluded(&ep.address, exclude)
-            {
+            if state.is_address_healthy(&ep.address) && !is_excluded(&ep.address, exclude) {
                 cumulative += ep.weight as usize;
                 if slot < cumulative {
                     return Some(Arc::clone(&ep.address));
@@ -136,7 +123,7 @@ fn select_by_weight(endpoints: &[WeightedEndpoint], tick: usize, total_weight: u
     Arc::clone(&endpoints.last().expect("non-empty").address)
 }
 
-/// Weighted round-robin selection skipping excluded endpoints (allocation-free).
+/// Weighted round-robin selection skipping excluded endpoints.
 fn select_by_weight_excluding(endpoints: &[WeightedEndpoint], tick: usize, exclude: &[Arc<str>]) -> Option<Arc<str>> {
     if exclude.is_empty() {
         let total: usize = endpoints.iter().map(|ep| ep.weight as usize).sum();
@@ -193,7 +180,7 @@ mod tests {
 
     #[test]
     fn single_endpoint() {
-        let rr = RoundRobin::new(vec![WeightedEndpoint::simple(Arc::from("127.0.0.1:8080"), 0, 1)]);
+        let rr = RoundRobin::new(vec![WeightedEndpoint::simple(Arc::from("127.0.0.1:8080"), 1)]);
         assert_eq!(&*rr.select(None, &[]).unwrap(), "127.0.0.1:8080", "select #1");
         assert_eq!(&*rr.select(None, &[]).unwrap(), "127.0.0.1:8080", "select #2");
         assert_eq!(&*rr.select(None, &[]).unwrap(), "127.0.0.1:8080", "select #3");
@@ -202,9 +189,9 @@ mod tests {
     #[test]
     fn full_cycle_ordering() {
         let rr = RoundRobin::new(vec![
-            WeightedEndpoint::simple(Arc::from("127.0.0.1:8080"), 0, 1),
-            WeightedEndpoint::simple(Arc::from("127.0.0.1:8081"), 1, 1),
-            WeightedEndpoint::simple(Arc::from("127.0.0.1:8082"), 2, 1),
+            WeightedEndpoint::simple(Arc::from("127.0.0.1:8080"), 1),
+            WeightedEndpoint::simple(Arc::from("127.0.0.1:8081"), 1),
+            WeightedEndpoint::simple(Arc::from("127.0.0.1:8082"), 1),
         ]);
         assert_eq!(
             &*rr.select(None, &[]).unwrap(),
@@ -231,8 +218,8 @@ mod tests {
     #[test]
     fn weighted_distribution() {
         let rr = RoundRobin::new(vec![
-            WeightedEndpoint::simple(Arc::from("10.0.0.1:80"), 0, 1),
-            WeightedEndpoint::simple(Arc::from("10.0.0.2:80"), 1, 3),
+            WeightedEndpoint::simple(Arc::from("10.0.0.1:80"), 1),
+            WeightedEndpoint::simple(Arc::from("10.0.0.2:80"), 3),
         ]);
 
         let mut counts = std::collections::HashMap::new();
@@ -254,9 +241,9 @@ mod tests {
     #[test]
     fn skips_unhealthy() {
         let rr = RoundRobin::new(vec![
-            WeightedEndpoint::simple(Arc::from("10.0.0.1:80"), 0, 1),
-            WeightedEndpoint::simple(Arc::from("10.0.0.2:80"), 1, 1),
-            WeightedEndpoint::simple(Arc::from("10.0.0.3:80"), 2, 1),
+            WeightedEndpoint::simple(Arc::from("10.0.0.1:80"), 1),
+            WeightedEndpoint::simple(Arc::from("10.0.0.2:80"), 1),
+            WeightedEndpoint::simple(Arc::from("10.0.0.3:80"), 1),
         ]);
         let state: ClusterHealthState = Arc::new(ClusterHealthEntry::new(
             vec![EndpointHealth::new(), EndpointHealth::new(), EndpointHealth::new()],
@@ -278,11 +265,34 @@ mod tests {
     }
 
     #[test]
+    fn health_lookup_is_by_address_not_position() {
+        let state: ClusterHealthState = Arc::new(ClusterHealthEntry::new(
+            vec![EndpointHealth::new(), EndpointHealth::new()],
+            vec![Arc::from("10.0.0.1:80"), Arc::from("10.0.0.2:80")],
+            None,
+            None,
+        ));
+        state.endpoints()[0].mark_unhealthy();
+
+        let rr = RoundRobin::new(vec![
+            WeightedEndpoint::simple(Arc::from("10.0.0.2:80"), 1),
+            WeightedEndpoint::simple(Arc::from("10.0.0.1:80"), 1),
+        ]);
+        for _ in 0..10 {
+            assert_eq!(
+                &*rr.select(Some(&state), &[]).unwrap(),
+                "10.0.0.2:80",
+                "must select the live endpoint by address, not by position"
+            );
+        }
+    }
+
+    #[test]
     fn weighted_with_health_redistributes() {
         let rr = RoundRobin::new(vec![
-            WeightedEndpoint::simple(Arc::from("10.0.0.1:80"), 0, 1),
-            WeightedEndpoint::simple(Arc::from("10.0.0.2:80"), 1, 3),
-            WeightedEndpoint::simple(Arc::from("10.0.0.3:80"), 2, 1),
+            WeightedEndpoint::simple(Arc::from("10.0.0.1:80"), 1),
+            WeightedEndpoint::simple(Arc::from("10.0.0.2:80"), 3),
+            WeightedEndpoint::simple(Arc::from("10.0.0.3:80"), 1),
         ]);
         let state: ClusterHealthState = Arc::new(ClusterHealthEntry::new(
             vec![EndpointHealth::new(), EndpointHealth::new(), EndpointHealth::new()],
@@ -317,8 +327,8 @@ mod tests {
     #[test]
     fn panic_mode_when_all_unhealthy() {
         let rr = RoundRobin::new(vec![
-            WeightedEndpoint::simple(Arc::from("10.0.0.1:80"), 0, 1),
-            WeightedEndpoint::simple(Arc::from("10.0.0.2:80"), 1, 1),
+            WeightedEndpoint::simple(Arc::from("10.0.0.1:80"), 1),
+            WeightedEndpoint::simple(Arc::from("10.0.0.2:80"), 1),
         ]);
         let state: ClusterHealthState = Arc::new(ClusterHealthEntry::new(
             vec![EndpointHealth::new(), EndpointHealth::new()],
@@ -358,8 +368,8 @@ mod tests {
     #[test]
     fn all_zero_weight_returns_none() {
         let rr = RoundRobin::new(vec![
-            WeightedEndpoint::simple(Arc::from("10.0.0.1:80"), 0, 0),
-            WeightedEndpoint::simple(Arc::from("10.0.0.2:80"), 1, 0),
+            WeightedEndpoint::simple(Arc::from("10.0.0.1:80"), 0),
+            WeightedEndpoint::simple(Arc::from("10.0.0.2:80"), 0),
         ]);
         assert!(
             rr.select(None, &[]).is_none(),
@@ -370,9 +380,9 @@ mod tests {
     #[test]
     fn select_excludes_attempted_endpoints() {
         let rr = RoundRobin::new(vec![
-            WeightedEndpoint::simple(Arc::from("10.0.0.1:80"), 0, 1),
-            WeightedEndpoint::simple(Arc::from("10.0.0.2:80"), 1, 1),
-            WeightedEndpoint::simple(Arc::from("10.0.0.3:80"), 2, 1),
+            WeightedEndpoint::simple(Arc::from("10.0.0.1:80"), 1),
+            WeightedEndpoint::simple(Arc::from("10.0.0.2:80"), 1),
+            WeightedEndpoint::simple(Arc::from("10.0.0.3:80"), 1),
         ]);
         let exclude = [Arc::<str>::from("10.0.0.1:80"), Arc::<str>::from("10.0.0.2:80")];
         for _ in 0..6 {
@@ -387,11 +397,10 @@ mod tests {
     #[test]
     fn select_falls_back_when_all_excluded() {
         let rr = RoundRobin::new(vec![
-            WeightedEndpoint::simple(Arc::from("10.0.0.1:80"), 0, 1),
-            WeightedEndpoint::simple(Arc::from("10.0.0.2:80"), 1, 1),
+            WeightedEndpoint::simple(Arc::from("10.0.0.1:80"), 1),
+            WeightedEndpoint::simple(Arc::from("10.0.0.2:80"), 1),
         ]);
         let exclude = [Arc::<str>::from("10.0.0.1:80"), Arc::<str>::from("10.0.0.2:80")];
-        // Strategy::select falls back; RoundRobin itself returns None when all excluded.
         assert!(
             rr.select(None, &exclude).is_none(),
             "round robin returns None when every endpoint is excluded"

@@ -20,7 +20,7 @@ use super::{endpoint::WeightedEndpoint, hash::fnv1a};
 
 /// Consistent-hash ring with configurable hash function and virtual node density.
 pub(crate) struct RingHash {
-    /// Deduplicated endpoint list with weights and original indices.
+    /// Deduplicated endpoint list with weights.
     endpoints: Vec<WeightedEndpoint>,
 
     /// Header whose value is hashed. Falls back to the URI path when `None`
@@ -58,8 +58,8 @@ impl RingHash {
 
     /// Hash the key and return the corresponding healthy endpoint.
     ///
-    /// Uses binary search on the sorted ring to find the first virtual node
-    /// with a hash >= the key hash. Probes clockwise to skip unhealthy endpoints.
+    /// Skips unhealthy endpoints, falling back to a hashed position when every
+    /// endpoint is unhealthy.
     pub(crate) fn select(
         &self,
         hash_key: Option<&str>,
@@ -106,10 +106,7 @@ impl RingHash {
             let idx = (start + offset) % ring_len;
             let ep_idx = self.ring[idx].1;
             let ep = &self.endpoints[ep_idx];
-            if !super::is_excluded(&ep.address, exclude)
-                && ep.index < state.endpoints().len()
-                && state.endpoints()[ep.index].is_healthy()
-            {
+            if !super::is_excluded(&ep.address, exclude) && state.is_address_healthy(&ep.address) {
                 return Some(Arc::clone(&ep.address));
             }
             let visited = visited.get_or_insert_with(|| smallvec::smallvec![false; self.endpoints.len()]);
@@ -409,8 +406,6 @@ mod tests {
         assert_eq!(first, second, "same key should always select same endpoint (xxhash)");
     }
 
-    /// Known-answer vectors from the reference `xxHash64` implementation
-    /// (seed 0), covering the <4B, 4–31B, and ≥32B code paths.
     #[test]
     fn xxhash64_known_answers() {
         assert_eq!(xxhash64(""), 0xEF46_DB37_51D8_E999);
@@ -424,9 +419,6 @@ mod tests {
         );
     }
 
-    /// Known-answer vectors from the reference `MurmurHash3` `x64_128`
-    /// implementation (seed 0, lower 64 bits), covering tail-only and
-    /// full-block code paths.
     #[test]
     fn murmur3_known_answers() {
         assert_eq!(murmur3_64(""), 0x0);
@@ -440,7 +432,6 @@ mod tests {
         );
     }
 
-    /// Known-answer vectors for FNV-1a 64.
     #[test]
     fn fnv1a_known_answers() {
         assert_eq!(fnv1a(""), 0xCBF2_9CE4_8422_2325);
@@ -528,8 +519,8 @@ mod tests {
     #[test]
     fn weighted_endpoints_get_more_vnodes() {
         let eps = vec![
-            WeightedEndpoint::simple(Arc::from("10.0.0.1:80"), 0, 1),
-            WeightedEndpoint::simple(Arc::from("10.0.0.2:80"), 1, 3),
+            WeightedEndpoint::simple(Arc::from("10.0.0.1:80"), 1),
+            WeightedEndpoint::simple(Arc::from("10.0.0.2:80"), 3),
         ];
         let ring = build_ring(&eps, &HashFunction::Fnv1a, 100);
         assert_eq!(ring.len(), 400, "weight 1 + weight 3 = 4 * 100 = 400 vnodes");
@@ -537,13 +528,15 @@ mod tests {
 
     #[test]
     fn xxhash64_reference_vector_empty() {
-        // Canonical XXH64("", seed=0) from the xxHash specification.
-        assert_eq!(xxhash64(""), 0xEF46_DB37_51D8_E999);
+        assert_eq!(
+            xxhash64(""),
+            0xEF46_DB37_51D8_E999,
+            "canonical XXH64(\"\", seed=0) from the xxHash specification"
+        );
     }
 
     #[test]
     fn xxhash64_deterministic() {
-        // Same input must always produce the same output across calls.
         let inputs = ["a", "abc", "Hello, world!", "abcdefghijklmnopqrstuvwxyz012345"];
         for input in inputs {
             let first = xxhash64(input);
@@ -570,7 +563,7 @@ mod tests {
 
     fn endpoints(n: usize) -> Vec<WeightedEndpoint> {
         (0..n)
-            .map(|i| WeightedEndpoint::simple(Arc::from(format!("10.0.0.{}:80", i + 1).as_str()), i, 1))
+            .map(|i| WeightedEndpoint::simple(Arc::from(format!("10.0.0.{}:80", i + 1).as_str()), 1))
             .collect()
     }
 

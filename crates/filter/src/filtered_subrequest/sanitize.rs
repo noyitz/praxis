@@ -150,6 +150,14 @@ fn strip_hop_by_hop_headers(headers: &mut HeaderMap, static_headers: &[&str]) {
     for value in connection_values {
         let Ok(value) = value.to_str() else { continue };
         for token in value.split(',').map(str::trim).filter(|token| !token.is_empty()) {
+            // A client-supplied Connection token must not delete headers the
+            // proxy owns (x-forwarded-*, Forwarded, x-praxis-*) or that are
+            // essential to routing/framing (Host, Content-Length); otherwise a
+            // filtered sub-request could be stripped of its authority and trust
+            // headers. Mirrors the main upstream path.
+            if praxis_core::reserved_headers::is_connection_token_protected(token) {
+                continue;
+            }
             headers.remove(token);
         }
     }
@@ -167,14 +175,27 @@ pub(super) fn body_exceeds_limit(mode: crate::body::BodyMode, body_len: usize) -
     }
 }
 
-/// Whether a response exceeds either the executor's global per-step ceiling
-/// or the nested pipeline's body-mode ceiling.
-pub(super) fn response_body_exceeds_limits(
+/// The effective response-body ceiling a body overflows, if any.
+///
+/// A response is bounded by both the executor's global per-step ceiling
+/// (`max_response_bytes`) and the nested pipeline's body-mode ceiling; the
+/// smaller of the two is authoritative. Returns `Some(effective_limit)` — the
+/// tripped ceiling to report as the overflow's `limit` — when `body_len`
+/// exceeds it, or `None` when the body is within every limit.
+pub(super) fn response_body_overflow_limit(
     mode: crate::body::BodyMode,
     max_response_bytes: usize,
     body_len: usize,
-) -> bool {
-    body_len > max_response_bytes || body_exceeds_limit(mode, body_len)
+) -> Option<usize> {
+    let mode_limit = match mode {
+        crate::body::BodyMode::SizeLimit { max_bytes }
+        | crate::body::BodyMode::StreamBuffer {
+            max_bytes: Some(max_bytes),
+        } => Some(max_bytes),
+        crate::body::BodyMode::Stream | crate::body::BodyMode::StreamBuffer { max_bytes: None } => None,
+    };
+    let effective = mode_limit.map_or(max_response_bytes, |limit| limit.min(max_response_bytes));
+    (body_len > effective).then_some(effective)
 }
 
 /// Extract only the listener-level streaming ceiling from a nested pipeline.

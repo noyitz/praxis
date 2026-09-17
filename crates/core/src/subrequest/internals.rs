@@ -16,9 +16,9 @@ use tracing::debug;
 use super::types::{SubRequestError, SubResponse};
 use crate::circuit::{CircuitBreakerConfig, CircuitBreakerRegistry, CircuitToken, PeerKey};
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // Metric names
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
 /// Metric name for total streaming sub-request count (with termination label).
 pub(super) const SUBREQUEST_STREAMS_TOTAL: &str = "praxis_subrequest_streams_total";
@@ -29,9 +29,9 @@ pub(super) const SUBREQUEST_STREAM_BYTES_TOTAL: &str = "praxis_subrequest_stream
 /// Metric name for header phase duration (shared buffered/streaming).
 pub(super) const SUBREQUEST_HEADER_DURATION_SECONDS: &str = "praxis_subrequest_header_duration_seconds";
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // SubRequestConnectorOptions
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
 /// Options for constructing a [`SubRequestConnector`].
 #[derive(Debug)]
@@ -46,9 +46,9 @@ pub struct SubRequestConnectorOptions {
     pub circuit_breaker: Option<CircuitBreakerConfig>,
 }
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // SubRequestConnector
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
 /// Shared HTTP connector for sub-requests.
 ///
@@ -200,9 +200,9 @@ impl std::fmt::Debug for SubRequestConnector {
     }
 }
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // RawExchange
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
 /// Live HTTP exchange after validated response headers.
 ///
@@ -228,9 +228,9 @@ pub(super) struct RawExchange<'a> {
     pub(super) deadline: tokio::time::Instant,
 }
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // Circuit Breaker Guard
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
 /// RAII guard ensuring every acquired circuit token is finalized.
 ///
@@ -287,9 +287,9 @@ impl Drop for CircuitGuard<'_> {
     }
 }
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // Protocol-aware completion check
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
 /// Protocol-aware clean completion check.
 ///
@@ -316,9 +316,9 @@ pub(super) fn record_header_termination(termination: &'static str) {
     debug!(termination, "sub-request: stream terminated at header phase");
 }
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // Header sanitization
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
 /// Headers that apply only to one HTTP connection and must not be forwarded
 /// across a sub-request boundary. Re-exported from the canonical
@@ -327,8 +327,7 @@ pub(super) fn record_header_termination(termination: &'static str) {
 pub(super) use crate::reserved_headers::HOP_BY_HOP_HEADERS;
 
 /// Collect the `Connection`-nominated header names, borrowed from the
-/// map's own `Connection` values. Costs nothing when the header is
-/// absent (an empty iterator collects without allocating).
+/// map's own `Connection` values.
 pub(super) fn connection_nominated_tokens(headers: &HeaderMap) -> Vec<&str> {
     headers
         .get_all(http::header::CONNECTION)
@@ -348,9 +347,15 @@ pub(super) fn is_boundary_stripped(name: &http::header::HeaderName, nominated: &
     // `HeaderName::as_str` is always lowercase, so the fixed list needs
     // no case folding; nominated tokens arrive raw from the wire.
     let name = name.as_str();
+    // A client-supplied `Connection` token must not delete a proxy-owned
+    // forwarding header (x-forwarded-*, Forwarded, Host, Content-Length): the
+    // main upstream path and filtered sub-requests already refuse this, so the
+    // core sub-request path honors the same rule. Reserved and fixed hop-by-hop
+    // headers are still stripped via their own branches.
     HOP_BY_HOP_HEADERS.contains(&name)
         || crate::reserved_headers::is_reserved(name)
-        || nominated.iter().any(|token| token.eq_ignore_ascii_case(name))
+        || (nominated.iter().any(|token| token.eq_ignore_ascii_case(name))
+            && !crate::reserved_headers::is_connection_token_protected(name))
 }
 
 /// Request-direction predicate: boundary-stripped plus the framing
@@ -360,9 +365,9 @@ pub(super) fn is_request_stripped(name: &http::header::HeaderName, nominated: &[
     lower == "content-length" || lower == "transfer-encoding" || is_boundary_stripped(name, nominated)
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Utilities
+// -----------------------------------------------------------------------------
 
 /// Whether a header is a transport-level header that must not be
 /// injected via framework metadata.

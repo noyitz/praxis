@@ -23,12 +23,14 @@ use pingora_core::{
 };
 use pingora_proxy::{Session, http_proxy};
 use praxis_core::{config::ABSOLUTE_MAX_BODY_BYTES, connectivity::Upstream};
-use praxis_filter::{BodyBuffer, BodyMode, CompressionConfig, FilterPipeline, HttpFilterContext, RequestExtensions};
+use praxis_filter::{BodyBuffer, BodyMode, FilterPipeline, HttpFilterContext, RequestExtensions};
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
 use super::{context::PingoraRequestCtx, metrics};
 
+/// Safe per-request compression configuration.
+mod compression;
 /// Upstream connection established hook.
 mod connected_to_upstream;
 /// Structured error responses for fatal proxy errors.
@@ -70,9 +72,9 @@ pub use with_body::PingoraHttpHandler;
 /// Load an HTTP handler for a single listener.
 ///
 /// Any TLS certificate watcher shutdown senders are appended to
-/// `cert_watcher_shutdowns`. The caller must keep this `Vec` alive
-/// until server shutdown; dropping the senders signals the watcher
-/// tasks to stop.
+/// `cert_watcher_shutdowns`. The watcher tasks run for the process
+/// lifetime; the caller keeps this `Vec` to stop them early via
+/// `send(true)` (dropping the senders does not stop them).
 ///
 /// ```ignore
 /// use std::sync::Arc;
@@ -169,12 +171,10 @@ where
 /// `set_*_body_mode` calls may widen limits; this helper preserves the original
 /// ceiling while still allowing upgrades between body mode variants.
 ///
-/// `Stream` mode passes through unconditionally because it delivers chunks
-/// as they arrive without accumulating them — there is no buffer to cap.
-/// A filter that downgrades from `StreamBuffer` to `Stream` at runtime is
-/// opting out of buffering entirely, which is always safe from a memory
-/// perspective. The pipeline-level body size limit (enforced separately
-/// via `SizeLimit`) remains the backstop for oversized payloads.
+/// `Stream` mode passes through unconditionally: it has no buffer to cap.
+/// A filter that downgrades from `StreamBuffer` to `Stream` opts out of
+/// buffering entirely. The pipeline-level body size limit (enforced
+/// separately via `SizeLimit`) remains the backstop for oversized payloads.
 fn clamp_body_mode_to_ceiling(mode: BodyMode, baseline: BodyMode) -> BodyMode {
     let ceiling = match baseline {
         BodyMode::StreamBuffer { max_bytes: Some(v) } | BodyMode::SizeLimit { max_bytes: v } => Some(v),
@@ -194,48 +194,7 @@ fn clamp_body_mode_to_ceiling(mode: BodyMode, baseline: BodyMode) -> BodyMode {
     }
 }
 
-/// Apply compression settings from the pipeline config to the Pingora response.
-fn adjust_compression(
-    session: &mut Session,
-    upstream_response: &pingora_http::ResponseHeader,
-    compression: Option<&CompressionConfig>,
-) {
-    use pingora_core::{modules::http::compression::ResponseCompression, protocols::http::compression::Algorithm};
-
-    let Some(cfg) = compression else {
-        return;
-    };
-
-    let Some(module) = session.downstream_modules_ctx.get_mut::<ResponseCompression>() else {
-        return;
-    };
-
-    let headers = &upstream_response.headers;
-
-    if !cfg.should_compress(headers) {
-        debug!("disabling compression: response does not qualify");
-        module.adjust_level(0);
-        return;
-    }
-
-    for (enabled, level, algo) in [
-        (cfg.gzip_enabled, cfg.gzip_level, Algorithm::Gzip),
-        (cfg.brotli_enabled, cfg.brotli_level, Algorithm::Brotli),
-        (cfg.zstd_enabled, cfg.zstd_level, Algorithm::Zstd),
-    ] {
-        if !enabled {
-            module.adjust_algorithm_level(algo, 0);
-        } else if let Some(lvl) = level {
-            module.adjust_algorithm_level(algo, lvl);
-        }
-    }
-}
-
 /// Shared legacy-default retry policy for requests that carry none.
-///
-/// The retry hooks run on every upstream response and connect failure;
-/// building a fresh `Arc<RetryPolicy>` there would heap-allocate per
-/// event for a value that never changes.
 fn legacy_default_policy() -> Arc<praxis_core::config::RetryPolicy> {
     static LEGACY_DEFAULT: std::sync::LazyLock<Arc<praxis_core::config::RetryPolicy>> =
         std::sync::LazyLock::new(|| Arc::new(praxis_core::config::RetryPolicy::legacy_default()));
@@ -543,7 +502,33 @@ fn record_passive_health(pipeline: &FilterPipeline, error: Option<&pingora_core:
         return;
     };
 
-    let is_failure = error.is_some() || ctx.upstream_response_status.is_some_and(|s| s >= 500);
+    // A request that never contacted the upstream carries no signal about the
+    // endpoint, so skip it. upstream_contacted is set once a peer is resolved
+    // and stays set across retries (unlike upstream_for_retry, which a retry
+    // clears to force reselection), so it distinguishes a genuine connect or
+    // read failure from a filter reject or a proxy-generated terminal response
+    // after endpoint selection, which would otherwise record a spurious
+    // observation against the untouched endpoint and skew a real failure
+    // streak.
+    if !ctx.upstream_contacted {
+        return;
+    }
+
+    // Classify the observation by the error's origin. A client-sourced
+    // (Downstream) error carries no signal about the endpoint, so when it
+    // arrives without an upstream response we skip the observation
+    // entirely: recording a failure would eject a healthy upstream, and
+    // recording a success would clear a real failure streak and mask a
+    // failing one. Upstream/Internal/Unset errors and 5xx responses count
+    // as failures (Internal/Unset are kept because a real endpoint failure
+    // is not always tagged Upstream, and missing one is worse here than an
+    // occasional false positive).
+    let is_downstream_error = error.is_some_and(|e| matches!(e.esource(), pingora_core::ErrorSource::Downstream));
+    if is_downstream_error && ctx.upstream_response_status.is_none() {
+        return;
+    }
+    let is_failure =
+        ctx.upstream_response_status.is_some_and(|s| s >= 500) || (error.is_some() && !is_downstream_error);
     apply_passive_threshold(health, idx, cluster_name, is_failure);
 }
 
@@ -805,7 +790,7 @@ struct BodyFilterOutput {
 
 impl BodyFilterOutput {
     /// Move the shared fields out of the filter context, replacing each
-    /// with its `Default` value (zero-allocation no-ops for the types involved).
+    /// with its `Default` value.
     fn take_from(fctx: &mut HttpFilterContext<'_>) -> Self {
         Self {
             cluster: fctx.cluster.take(),
@@ -990,7 +975,6 @@ mod tests {
     fn response_502_does_not_retry_under_legacy_default() {
         let mut ctx = PingoraRequestCtx::default();
         ctx.request_is_idempotent = true;
-        // Legacy default is connect_failure only — no Status5xx.
         assert!(
             maybe_retry_response(&mut ctx, 502).is_none(),
             "legacy default must forward 5xx without retry"
@@ -1014,7 +998,6 @@ mod tests {
     fn non_idempotent_clears_pingora_default_retry_flag() {
         let mut ctx = PingoraRequestCtx::default();
         ctx.request_is_idempotent = false;
-        // Simulate Pingora marking the error retriable by default.
         let mut e = make_error();
         e.set_retry(true);
         let e = handle_connect_failure(&mut ctx, e);
@@ -1118,6 +1101,112 @@ mod tests {
         assert!(
             entry.endpoints()[0].is_healthy(),
             "single failure should not yet mark unhealthy (threshold=3)"
+        );
+    }
+
+    #[test]
+    fn passive_health_downstream_error_is_not_failure() {
+        let (pipeline, ctx) = make_passive_scenario(Some(1), Some(1));
+        let error = make_error().into_down();
+        record_passive_health(&pipeline, Some(&error), &ctx);
+
+        let registry = pipeline.health_registry().unwrap();
+        let entry = registry.get("test-cluster").unwrap();
+        assert!(
+            entry.endpoints()[0].is_healthy(),
+            "a downstream/client error must not mark the endpoint unhealthy"
+        );
+    }
+
+    #[test]
+    fn passive_health_downstream_error_with_5xx_still_counts_as_failure() {
+        let (pipeline, mut ctx) = make_passive_scenario(Some(1), Some(1));
+        ctx.upstream_response_status = Some(503);
+        let error = make_error().into_down();
+        record_passive_health(&pipeline, Some(&error), &ctx);
+
+        let registry = pipeline.health_registry().unwrap();
+        let entry = registry.get("test-cluster").unwrap();
+        assert!(
+            !entry.endpoints()[0].is_healthy(),
+            "a downstream error with an upstream 503 must still mark the endpoint unhealthy"
+        );
+    }
+
+    #[test]
+    fn passive_health_downstream_error_does_not_reset_failure_streak() {
+        let (pipeline, ctx) = make_passive_scenario(Some(2), Some(1));
+        let mut upstream_err = make_error();
+        upstream_err.as_up();
+        let downstream_err = make_error().into_down();
+
+        record_passive_health(&pipeline, Some(&upstream_err), &ctx);
+        record_passive_health(&pipeline, Some(&downstream_err), &ctx);
+        record_passive_health(&pipeline, Some(&upstream_err), &ctx);
+
+        let registry = pipeline.health_registry().unwrap();
+        let entry = registry.get("test-cluster").unwrap();
+        assert!(
+            !entry.endpoints()[0].is_healthy(),
+            "two upstream failures must eject the endpoint even with an interleaved client error"
+        );
+    }
+
+    #[test]
+    fn passive_health_upstream_error_is_failure() {
+        let (pipeline, ctx) = make_passive_scenario(Some(1), Some(1));
+        let mut error = make_error();
+        error.as_up();
+        record_passive_health(&pipeline, Some(&error), &ctx);
+
+        let registry = pipeline.health_registry().unwrap();
+        let entry = registry.get("test-cluster").unwrap();
+        assert!(
+            !entry.endpoints()[0].is_healthy(),
+            "an upstream error at unhealthy-threshold 1 must mark the endpoint unhealthy"
+        );
+    }
+
+    #[test]
+    fn passive_health_skips_observations_without_upstream_contact() {
+        let (pipeline, mut ctx) = make_passive_scenario(Some(2), Some(1));
+        let mut upstream_err = make_error();
+        upstream_err.as_up();
+
+        record_passive_health(&pipeline, Some(&upstream_err), &ctx);
+
+        ctx.upstream_contacted = false;
+        record_passive_health(&pipeline, None, &ctx);
+
+        ctx.upstream_response_status = Some(200);
+        record_passive_health(&pipeline, None, &ctx);
+        ctx.upstream_response_status = None;
+
+        ctx.upstream_contacted = true;
+        record_passive_health(&pipeline, Some(&upstream_err), &ctx);
+
+        let registry = pipeline.health_registry().unwrap();
+        let entry = registry.get("test-cluster").unwrap();
+        assert!(
+            !entry.endpoints()[0].is_healthy(),
+            "observations without upstream contact must not reset the failure streak"
+        );
+    }
+
+    #[test]
+    fn passive_health_records_connect_failure_after_reselect_clears_upstream() {
+        let (pipeline, mut ctx) = make_passive_scenario(Some(1), Some(1));
+        ctx.upstream_for_retry = None;
+        ctx.upstream_contacted = true;
+        let mut error = make_error();
+        error.as_up();
+        record_passive_health(&pipeline, Some(&error), &ctx);
+
+        let registry = pipeline.health_registry().unwrap();
+        let entry = registry.get("test-cluster").unwrap();
+        assert!(
+            !entry.endpoints()[0].is_healthy(),
+            "a connect failure after reselection cleared upstream_for_retry must still count"
         );
     }
 
@@ -1550,8 +1639,6 @@ mod tests {
 
     #[test]
     fn aborted_response_body_at_eos_is_not_marked_delivered() {
-        // access_log declares read-only response body access, so the hook
-        // reaches the SizeLimit check instead of early-returning.
         let pipeline = access_log_pipeline();
         let mut ctx = make_fallback_ctx();
         ctx.response_body_mode = BodyMode::SizeLimit { max_bytes: 4 };
@@ -1747,7 +1834,6 @@ mod tests {
         );
         ctx.response_body_bytes = 4096;
 
-        // Verify recording on exchange span does not panic.
         ctx.upstream_exchange_span.record("http.response.status_code", 200_u16);
         ctx.upstream_exchange_span.record("http.response.body.size", 4096_u64);
     }
@@ -1761,12 +1847,10 @@ mod tests {
             "server.address" = tracing::field::Empty,
             "upstream.cluster" = tracing::field::Empty,
         );
-        // Exchange span remains disabled (default).
         assert!(
             ctx.upstream_exchange_span.is_disabled(),
             "exchange span should be disabled by default"
         );
-        // Should not panic when exchange span is disabled.
     }
 
     // -------------------------------------------------------------------------
@@ -1912,6 +1996,8 @@ mod tests {
         ctx.cluster = Some(Arc::from(cluster));
         ctx.selected_endpoint_index = Some(endpoint_idx);
         ctx.upstream_response_status = status;
+        // A passive-health observation implies the upstream was contacted.
+        ctx.upstream_contacted = true;
         ctx
     }
 

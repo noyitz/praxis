@@ -3,8 +3,7 @@
 
 //! Extracts top-level JSON fields from the request body and promotes them to request headers.
 //!
-//! Parsing walks the complete top-level object without building a full DOM:
-//! unmapped values are skipped, duplicate keys are last-wins (matching
+//! Unmapped values are skipped, duplicate keys are last-wins (matching
 //! `serde_json` and typical backend parsers), and trailing non-whitespace
 //! content after the document blocks promotion so a promoted value always
 //! matches what the backend will parse.
@@ -49,8 +48,7 @@ struct Promoted;
 /// Extracts top-level fields from a JSON request body and promotes
 /// their values to request headers using [`StreamBuffer`] mode.
 ///
-/// Uses a map visitor (not a full JSON DOM). Unmapped values are skipped;
-/// the whole top-level object is scanned so duplicate keys are last-wins
+/// Unmapped values are skipped; duplicate keys are last-wins
 /// (matching `serde_json` and typical backend parsers), and trailing
 /// non-whitespace content after the document blocks promotion.
 ///
@@ -112,10 +110,6 @@ pub struct JsonBodyFieldFilter {
     pub(crate) mappings: Vec<(String, String)>,
 
     /// Field names from `mappings`, pre-built for the extraction walk.
-    ///
-    /// The extractor probes this on every JSON key it visits, and the
-    /// hook can run once per buffered chunk; rebuilding the set from
-    /// `mappings` each call allocated per chunk for config-stable data.
     needed: std::collections::HashSet<String>,
 }
 
@@ -184,10 +178,19 @@ impl HttpFilter for JsonBodyFieldFilter {
         &self,
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
-        _end_of_stream: bool,
+        end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
+        // Only extract once the full body is available. A non-final chunk can
+        // be a complete JSON object on its own; promoting from it would let a
+        // field the backend never sees (overridden by trailing bytes in a
+        // later chunk) drive routing. StreamBuffer delivers the complete
+        // accumulated body on the end-of-stream pass, so defer to it.
+        if !end_of_stream {
+            return Ok(FilterAction::Continue);
+        }
+
         // Skip re-entry after a successful promote (BodyDone also tells the
-        // pipeline to stop calling us). Do not key off header names — an
+        // pipeline to stop calling us). Do not key off header names: an
         // incoming or pre-existing X-* must not block the first promotion.
         if ctx.get_filter_state::<Promoted>().is_some() {
             return Ok(FilterAction::BodyDone);

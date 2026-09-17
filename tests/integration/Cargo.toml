@@ -8,7 +8,9 @@ readme = "../../README.md"
 publish = false
 
 [features]
-default = []
+# Matches the praxis-filter default so a single-test run exercises the
+# configuration the default build ships.
+default = ["policy-engine"]
 policy-engine = ["praxis-filter/policy-engine"]
 basic-auth-filter = ["praxis-filter/basic-auth-filter"]
 no-mac-cert-rotation-tests = []
@@ -27,7 +29,7 @@ http = { workspace = true }
 # Used only by the policy example test to mint HS256 JWTs for the
 # happy-path case (matches the filter crate's signing dependency).
 jsonwebtoken = { workspace = true }
-# Used only by url_target_tls to attach the test CA to a prepared HttpPeer.
+# Used by TLS target tests and compression codec round-trip tests.
 pingora-core = { workspace = true }
 praxis = { workspace = true }
 praxis-core = { workspace = true }

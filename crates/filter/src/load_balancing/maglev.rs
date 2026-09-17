@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use praxis_core::health::{ClusterHealthState, EndpointHealth};
+use praxis_core::health::ClusterHealthState;
 
 use super::endpoint::WeightedEndpoint;
 
@@ -35,7 +35,7 @@ const SENTINEL: u32 = u32::MAX;
 /// Endpoints are expanded into `weight` replicas during population, so the
 /// resulting distribution is proportional to endpoint weight.
 pub(crate) struct Maglev {
-    /// Deduplicated endpoint list with weights and original indices.
+    /// Deduplicated endpoint list with weights.
     endpoints: Vec<WeightedEndpoint>,
 
     /// Header whose value is hashed. Falls back to the URI path when `None`
@@ -65,8 +65,8 @@ impl Maglev {
 
     /// Hash the key and return the corresponding healthy endpoint.
     ///
-    /// Skips unhealthy and excluded endpoints by probing adjacent table slots,
-    /// falling back to the original selection if all are unhealthy.
+    /// Skips unhealthy and excluded endpoints, falling back to the original
+    /// selection if all are unhealthy.
     pub(crate) fn select(
         &self,
         hash_key: Option<&str>,
@@ -82,9 +82,7 @@ impl Maglev {
         let start = (fnv1a_seeded(key, 0) as usize) % len;
 
         if let Some(state) = health
-            && let Some(addr) = self.probe(start, exclude, |ep| {
-                state.endpoints().get(ep.index).is_some_and(EndpointHealth::is_healthy)
-            })
+            && let Some(addr) = self.probe(start, exclude, |ep| state.is_address_healthy(&ep.address))
         {
             return Some(addr);
         }
@@ -98,8 +96,8 @@ impl Maglev {
     /// The probe is bounded by distinct endpoints rather than table
     /// slots (the ring-hash precedent): with every endpoint rejected,
     /// walking all 65k slots would revisit each endpoint's slots
-    /// thousands of times — hundreds of microseconds per request exactly
-    /// during a full-cluster outage.
+    /// thousands of times, hundreds of microseconds per request, during
+    /// a full-cluster outage.
     #[expect(
         clippy::indexing_slicing,
         reason = "table slot and owner index are in bounds by construction"
@@ -241,7 +239,7 @@ fn fnv1a_seeded(s: &str, seed: u64) -> u64 {
 mod tests {
     use std::collections::{HashMap, HashSet};
 
-    use praxis_core::health::ClusterHealthEntry;
+    use praxis_core::health::{ClusterHealthEntry, EndpointHealth};
 
     use super::*;
 
@@ -329,8 +327,8 @@ mod tests {
     #[test]
     fn weight_stability() {
         let eps = vec![
-            WeightedEndpoint::simple(Arc::from("10.0.0.1:80"), 0, 3),
-            WeightedEndpoint::simple(Arc::from("10.0.0.2:80"), 1, 1),
+            WeightedEndpoint::simple(Arc::from("10.0.0.1:80"), 3),
+            WeightedEndpoint::simple(Arc::from("10.0.0.2:80"), 1),
         ];
         let mg = Maglev::new(eps, None);
 
@@ -357,7 +355,6 @@ mod tests {
         let keys: Vec<String> = (0..10_000).map(|i| format!("/k-{i}")).collect();
         let before: Vec<Arc<str>> = keys.iter().map(|k| four.select(Some(k), None, &[]).unwrap()).collect();
 
-        // Drop the 4th backend (10.0.0.4:80).
         let three = Maglev::new(endpoints(3), None);
 
         let dropped: Arc<str> = Arc::from("10.0.0.4:80");
@@ -365,7 +362,7 @@ mod tests {
         let mut reassigned = 0_usize;
         for (k, prev) in keys.iter().zip(&before) {
             if *prev == dropped {
-                continue; // These must move; not counted.
+                continue;
             }
             survivors += 1;
             if four.select(Some(k), None, &[]).unwrap() != three.select(Some(k), None, &[]).unwrap() {
@@ -398,9 +395,6 @@ mod tests {
         let four = Maglev::new(endpoints(4), None);
         let added: Arc<str> = Arc::from("10.0.0.4:80");
 
-        // Keys that don't land on the newly-added backend should almost all
-        // stay on the backend they had before (Maglev's minimal-disruption
-        // property, in the scale-up direction).
         let mut stayed_existing = 0_usize;
         let mut reassigned = 0_usize;
         for i in 0..10_000 {
@@ -408,7 +402,7 @@ mod tests {
             let before = three.select(Some(&k), None, &[]).unwrap();
             let after = four.select(Some(&k), None, &[]).unwrap();
             if after == added {
-                continue; // Expected to move onto the new backend.
+                continue;
             }
             stayed_existing += 1;
             if before != after {
@@ -448,7 +442,7 @@ mod tests {
     /// Build `n` equal-weight endpoints `10.0.0.{i+1}:80`.
     fn endpoints(n: usize) -> Vec<WeightedEndpoint> {
         (0..n)
-            .map(|i| WeightedEndpoint::simple(Arc::from(format!("10.0.0.{}:80", i + 1).as_str()), i, 1))
+            .map(|i| WeightedEndpoint::simple(Arc::from(format!("10.0.0.{}:80", i + 1).as_str()), 1))
             .collect()
     }
 

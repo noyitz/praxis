@@ -58,9 +58,7 @@ pub fn is_exceeded() -> bool {
 /// RSS-based memory pressure detector with cached sampling.
 ///
 /// Reads `/proc/self/status` at most every `CHECK_INTERVAL_MS`
-/// and compares RSS against a fixed threshold. All fields are
-/// atomic for lock-free concurrent access from multiple worker
-/// threads.
+/// and compares RSS against a fixed threshold.
 ///
 /// ```
 /// use praxis_core::memory::MemoryPressure;
@@ -108,7 +106,7 @@ impl MemoryPressure {
     fn maybe_refresh(&self) {
         let now = epoch_ms();
         let last = self.last_check_ms.load(Ordering::Relaxed);
-        if now.saturating_sub(last) < CHECK_INTERVAL_MS {
+        if !is_sample_stale(last, now) {
             return;
         }
         if self
@@ -127,6 +125,19 @@ impl MemoryPressure {
 // -----------------------------------------------------------------------------
 // Platform Helpers
 // -----------------------------------------------------------------------------
+
+/// Whether a cached RSS sample taken at `last_ms` is stale relative to
+/// `now_ms` and must be refreshed.
+///
+/// True once `CHECK_INTERVAL_MS` has elapsed, and also when the clock moved
+/// backward (`now_ms < last_ms`). The interval is measured on the wall clock
+/// (`epoch_ms`), so an NTP correction, manual clock set, or VM restore that
+/// steps time backward would otherwise freeze RSS sampling (and the
+/// load-shedding verdict) until the clock climbed back past
+/// `last_ms + CHECK_INTERVAL_MS`.
+fn is_sample_stale(last_ms: u64, now_ms: u64) -> bool {
+    now_ms < last_ms || now_ms.saturating_sub(last_ms) >= CHECK_INTERVAL_MS
+}
 
 /// Current epoch time in milliseconds.
 fn epoch_ms() -> u64 {
@@ -208,6 +219,22 @@ mod tests {
         assert!(
             !is_exceeded(),
             "global is_exceeded should return false when uninitialized"
+        );
+    }
+
+    #[test]
+    fn sample_staleness_handles_forward_and_backward_clock() {
+        assert!(
+            !is_sample_stale(1_000, 1_000 + CHECK_INTERVAL_MS - 1),
+            "a sample within the interval is fresh"
+        );
+        assert!(
+            is_sample_stale(1_000, 1_000 + CHECK_INTERVAL_MS),
+            "a sample is stale once the interval has elapsed"
+        );
+        assert!(
+            is_sample_stale(1_000, 500),
+            "a backward clock step forces a refresh instead of freezing sampling"
         );
     }
 

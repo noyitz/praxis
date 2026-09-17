@@ -504,13 +504,10 @@ mod tests {
     /// Build a two-endpoint list for strategy tests.
     fn make_endpoints() -> Vec<WeightedEndpoint> {
         vec![
-            WeightedEndpoint::simple(Arc::from("10.0.0.1:80"), 0, 1),
-            WeightedEndpoint::simple(Arc::from("10.0.0.2:80"), 1, 1),
+            WeightedEndpoint::simple(Arc::from("10.0.0.1:80"), 1),
+            WeightedEndpoint::simple(Arc::from("10.0.0.2:80"), 1),
         ]
     }
-    /// Upstream's retry engine excludes already-attempted endpoints. The
-    /// strategies added here must honour that contract too, or a retry lands
-    /// straight back on the endpoint that just failed.
     #[test]
     #[expect(clippy::too_many_lines, reason = "table-driven over four strategy configs")]
     fn new_strategies_skip_excluded_endpoints() {
@@ -523,8 +520,8 @@ mod tests {
 
         let endpoints = || {
             vec![
-                WeightedEndpoint::simple(Arc::from("10.0.0.1:80"), 0, 1),
-                WeightedEndpoint::simple(Arc::from("10.0.0.2:80"), 1, 1),
+                WeightedEndpoint::simple(Arc::from("10.0.0.1:80"), 1),
+                WeightedEndpoint::simple(Arc::from("10.0.0.2:80"), 1),
             ]
         };
         let excluded: Vec<Arc<str>> = vec![Arc::from("10.0.0.1:80")];
